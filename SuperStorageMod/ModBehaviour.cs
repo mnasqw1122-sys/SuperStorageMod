@@ -33,15 +33,25 @@ namespace SuperStorageMod
 
         private void Awake()
         {
-            foreach (var t in tiers)
+            Debug.Log("[SuperStorageMod] Awake started.");
+            try
             {
-                LocalizationManager.SetOverrideText(t.nameKey, t.displayName);
+                foreach (var t in tiers)
+                {
+                    LocalizationManager.SetOverrideText(t.nameKey, t.displayName);
+                }
+                Debug.Log("[SuperStorageMod] Localization set.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[SuperStorageMod] Error in Awake: {ex}");
             }
         }
 
         private void OnEnable()
         {
             LevelManager.OnLevelInitialized += OnLevelInitialized;
+            Debug.Log("[SuperStorageMod] OnEnable: Subscribed to OnLevelInitialized.");
         }
 
         private void OnDisable()
@@ -51,17 +61,54 @@ namespace SuperStorageMod
 
         private void OnLevelInitialized()
         {
+            Debug.Log("[SuperStorageMod] OnLevelInitialized started.");
             Inject().Forget();
         }
 
-        private async UniTask Inject()
+        private async UniTaskVoid Inject()
         {
-            await UniTask.Yield();
-            var tree = FindStoragePerkTree();
-            if (tree == null) return;
+            try
+            {
+                Debug.Log("[SuperStorageMod] Injecting... Waiting for level load to settle.");
+                // 增加延迟，确保 Level Initialization 完全结束，避免与 SetCharacterPosition 等逻辑冲突
+                await UniTask.Delay(System.TimeSpan.FromSeconds(1)); 
+                
+                Debug.Log("[SuperStorageMod] Starting DrainBufferToStorage...");
+                // 1. 处理缓存物品
+                await DrainBufferToStorage();
+                Debug.Log("[SuperStorageMod] DrainBufferToStorage finished.");
+                
+                // 2. 查找技能树
+                var tree = FindStoragePerkTree();
+                if (tree == null)
+                {
+                    Debug.LogWarning("[SuperStorageMod] Storage PerkTree not found! Mod will not function.");
+                    return;
+                }
+                Debug.Log($"[SuperStorageMod] Found existing PerkTree: {tree.name}");
 
+                // 3. 继续原有逻辑
+                InjectInternal(tree);
+
+                // 4. 恢复解锁状态
+                RestoreUnlockedFromDisk(tree);
+                
+                Debug.Log("[SuperStorageMod] Injection complete.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[SuperStorageMod] Fatal error in Inject: {ex}");
+            }
+        }
+
+        private void InjectInternal(PerkTree tree)
+        {
             var basePerk = FindBaseStoragePerk(tree);
-            if (basePerk == null) return;
+            if (basePerk == null)
+            {
+                 Debug.LogWarning("[SuperStorageMod] Base storage perk not found.");
+                 return;
+            }
 
             var baseNode = tree.RelationGraphOwner.RelationGraph.GetRelatedNode(basePerk);
             if (baseNode == null) return;
@@ -72,7 +119,6 @@ namespace SuperStorageMod
 
             var graph = tree.RelationGraphOwner.graph;
 
-            var basePos = baseNode.cachedPosition;
             // 将新增节点放到官方空白区域并分别挂载到指定节点
             var placements = new (string anchorRawName, System.Func<PerkRelationNode, Vector2> offsetFn, int tierIndex)[]
             {
@@ -131,10 +177,7 @@ namespace SuperStorageMod
             }
 
             tree.Load();
-
-            RestoreUnlockedFromDisk(tree);
             SaveUnlockedBackupToDisk(tree);
-
             PlayerStorage.NotifyCapacityDirty();
         }
 
@@ -216,8 +259,18 @@ namespace SuperStorageMod
         {
             try
             {
-                var connType = from.GetType().Assembly.GetType("NodeCanvas.Framework.Connection");
+                // 查找 NodeCanvas.Framework.Connection 类型
+                // 由于 NodeCanvas 可能在单独的程序集中，不能直接从 PerkRelationNode 的程序集获取
+                var nodeType = from.GetType();
+                while (nodeType != null && nodeType.Name != "Node")
+                {
+                    nodeType = nodeType.BaseType;
+                }
+                if (nodeType == null) return;
+
+                var connType = nodeType.Assembly.GetType("NodeCanvas.Framework.Connection");
                 if (connType == null) return;
+
                 var methods = connType.GetMethods(BindingFlags.Public | BindingFlags.Static);
                 var create = methods.FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length >= 2);
                 if (create == null) return;
@@ -228,7 +281,8 @@ namespace SuperStorageMod
                 }
                 else
                 {
-                    create.Invoke(null, new object[] { from, to, typeof(PerkRelationConnection) });
+                    // 使用 from.outConnectionType 获取连接类型，比直接 typeof 更安全
+                    create.Invoke(null, new object[] { from, to, from.outConnectionType });
                 }
             }
             catch (Exception ex)
@@ -325,6 +379,30 @@ namespace SuperStorageMod
             float mag = diffs.Select(d => Mathf.Abs(d)).Max();
             mag = Mathf.Max(mag, 6f);
             return sign * mag;
+        }
+
+        private static async UniTask DrainBufferToStorage()
+        {
+            var buf = PlayerStorage.IncomingItemBuffer;
+            if (buf == null) return;
+            int guard = 128;
+            while (buf.Count > 0 && guard-- > 0)
+            {
+                int idx = buf.Count - 1;
+                // 防止越界
+                if (idx < 0 || idx >= buf.Count) break;
+
+                int countBefore = buf.Count;
+                try
+                {
+                    await PlayerStorage.TakeBufferItem(idx);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[SuperStorageMod] Failed to take buffer item at {idx}: {ex}");
+                }
+                if (buf.Count == countBefore) break;
+            }
         }
 
         private class ModUnlockWatcher : MonoBehaviour
@@ -424,20 +502,39 @@ namespace SuperStorageMod
 
         private static void RestoreUnlockedFromDisk(PerkTree tree)
         {
+            var path = GetBackupPath();
+            if (!File.Exists(path)) return;
+            string[]? lines = null;
             try
             {
-                var path = GetBackupPath();
-                if (!File.Exists(path)) return;
-                var lines = File.ReadAllLines(path);
-                if (lines == null || lines.Length == 0) return;
-                var set = new System.Collections.Generic.HashSet<string>(lines.Where(s => !string.IsNullOrEmpty(s)));
-                foreach (var p in tree.Perks.Where(p => p != null && set.Contains(p.gameObject.name)))
+                lines = File.ReadAllLines(path);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod] Failed to read backup file: {ex.Message}");
+                return;
+            }
+
+            if (lines == null || lines.Length == 0) return;
+            var set = new System.Collections.Generic.HashSet<string>(lines.Where(s => !string.IsNullOrEmpty(s)));
+
+            foreach (var p in tree.Perks)
+            {
+                if (p == null || !set.Contains(p.gameObject.name)) continue;
+                
+                try
                 {
-                    var mi = typeof(Perk).GetMethod("ForceUnlock", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    mi?.Invoke(p, null);
+                    if (!p.Unlocked)
+                    {
+                        p.ForceUnlock();
+                        Debug.Log($"[SuperStorageMod] Restored perk: {p.gameObject.name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[SuperStorageMod] Failed to restore perk {p.gameObject.name}: {ex}");
                 }
             }
-            catch { }
         }
     }
 }
