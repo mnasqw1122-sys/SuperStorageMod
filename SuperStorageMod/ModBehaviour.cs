@@ -85,7 +85,7 @@ namespace SuperStorageMod
                     Debug.LogWarning("[SuperStorageMod] Storage PerkTree not found! Mod will not function.");
                     return;
                 }
-                Debug.Log($"[SuperStorageMod] Found existing PerkTree: {tree.name}");
+                Debug.Log($"[SuperStorageMod] Found existing PerkTree: {tree.name} (ID: {tree.ID})");
 
                 // 3. 继续原有逻辑
                 InjectInternal(tree);
@@ -110,8 +110,13 @@ namespace SuperStorageMod
                  return;
             }
 
+            // 确保找到的是有效的 RelationNode
             var baseNode = tree.RelationGraphOwner.RelationGraph.GetRelatedNode(basePerk);
-            if (baseNode == null) return;
+            if (baseNode == null) 
+            {
+                Debug.LogWarning($"[SuperStorageMod] Related node for base perk {basePerk.name} not found.");
+                return;
+            }
 
             var requireTimeTicks = GetPrivateLong(basePerk.Requirement, "requireTime");
             var icon = basePerk.Icon;
@@ -139,7 +144,12 @@ namespace SuperStorageMod
                 if (TreeAlreadyHasTier(tree, tier.nameKey)) continue;
 
                 var anchor = FindPerkByRawName(tree, p.anchorRawName);
-                if (anchor == null) continue;
+                if (anchor == null) 
+                {
+                    // 尝试用 basePerk 作为备用锚点，如果指定的锚点找不到
+                    anchor = basePerk;
+                }
+                
                 var anchorNode = tree.RelationGraphOwner.RelationGraph.GetRelatedNode(anchor);
                 if (anchorNode == null) continue;
 
@@ -170,7 +180,11 @@ namespace SuperStorageMod
 
                 AddPerkToTree(tree, perk);
                 var node = AddGraphNode(graph, perk);
-                if (node == null) continue;
+                if (node == null) 
+                {
+                    Debug.LogError($"[SuperStorageMod] Failed to add graph node for {tier.nameKey}");
+                    continue;
+                }
                 var offset = p.offsetFn(anchorNode);
                 node.cachedPosition = anchorNode.cachedPosition + offset;
                 // 不与官方节点建立连接，保持完全独立
@@ -185,17 +199,25 @@ namespace SuperStorageMod
         {
             var trees = PerkTreeManager.Instance?.perkTrees;
             if (trees == null) return null;
-            var byName = trees.FirstOrDefault(t => t != null && t.DisplayName.Contains("仓库扩容"));
-            if (byName != null) return byName;
-            return trees.FirstOrDefault(t => t != null && t.Perks.Any(p => p != null && p.GetComponent<AddPlayerStorage>() != null));
+            
+            // 优先查找包含 AddPlayerStorage 组件的 PerkTree，这更可靠
+            var byComponent = trees.FirstOrDefault(t => t != null && t.Perks.Any(p => p != null && p.GetComponent<AddPlayerStorage>() != null));
+            if (byComponent != null) return byComponent;
+
+            // 其次尝试通过 ID 查找（假设官方 ID 不变）
+            var byID = trees.FirstOrDefault(t => t != null && (t.ID == "Main" || t.ID == "PerkTree_Main")); // 示例 ID，实际可能不同
+            if (byID != null) return byID;
+
+            // 最后尝试通过名称查找
+            return trees.FirstOrDefault(t => t != null && (t.DisplayName.Contains("仓库") || t.DisplayName.Contains("Storage")));
         }
 
         private static Perk? FindBaseStoragePerk(PerkTree tree)
         {
             var candidates = tree.Perks.Where(p => p != null && p.GetComponent<AddPlayerStorage>() != null).ToList();
             if (candidates.Count == 0) return null;
-            var exactName = candidates.FirstOrDefault(p => (p.DisplayName ?? string.Empty).Contains("超级仓库"));
-            if (exactName != null) return exactName;
+
+            // 优先通过组件数值查找 (90-110 容量的通常是基础包)
             var byCap100 = candidates.FirstOrDefault(p =>
             {
                 var add = p.GetComponent<AddPlayerStorage>();
@@ -204,7 +226,13 @@ namespace SuperStorageMod
                 var v = fi.GetValue(add);
                 return v is int i && i >= 90 && i <= 110;
             });
-            return byCap100 ?? candidates.First();
+            if (byCap100 != null) return byCap100;
+
+            // 其次尝试名称
+            var exactName = candidates.FirstOrDefault(p => (p.DisplayName ?? string.Empty).Contains("超级仓库") || (p.DisplayName ?? string.Empty).Contains("Storage"));
+            if (exactName != null) return exactName;
+
+            return candidates.First();
         }
 
         private bool TreeAlreadyHasTier(PerkTree tree, string nameKey)
@@ -223,29 +251,56 @@ namespace SuperStorageMod
         {
             try
             {
-                var methods = graph.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(m => m.Name == "AddNode" && m.IsGenericMethodDefinition && m.GetGenericArguments().Length == 1).ToList();
-                object? node = null;
+                // 查找 Graph.AddNode<T>() 方法
+                var methods = graph.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                MethodInfo? addNodeMethod = null;
+
                 foreach (var m in methods)
                 {
-                    var gen = m.MakeGenericMethod(typeof(PerkRelationNode));
-                    var ps = gen.GetParameters();
-                    if (ps.Length == 0)
+                    if (m.Name != "AddNode") continue;
+                    if (!m.IsGenericMethodDefinition) continue;
+                    
+                    var typeArgs = m.GetGenericArguments();
+                    if (typeArgs.Length != 1) continue;
+
+                    var parameters = m.GetParameters();
+                    if (parameters.Length == 0)
                     {
-                        node = gen.Invoke(graph, Array.Empty<object>());
+                        // AddNode<T>()
+                        addNodeMethod = m;
                         break;
                     }
-                    if (ps.Length == 1 && ps[0].ParameterType.FullName == typeof(UnityEngine.Vector2).FullName)
+                    if (parameters.Length == 1 && parameters[0].ParameterType == typeof(Vector2))
                     {
-                        node = gen.Invoke(graph, new object[] { Vector2.zero });
-                        break;
+                        // AddNode<T>(Vector2) - 优先使用带坐标的版本，设为 0
+                        addNodeMethod = m;
+                        // 不 break，继续看有没有无参的，或者就用这个
                     }
                 }
-                PerkRelationNode? prn = node as PerkRelationNode;
-                if (prn != null)
+
+                if (addNodeMethod != null)
                 {
-                    prn.relatedNode = perk;
-                    return prn;
+                    var gen = addNodeMethod.MakeGenericMethod(typeof(PerkRelationNode));
+                    var ps = gen.GetParameters();
+                    object? node = null;
+                    if (ps.Length == 0)
+                    {
+                         node = gen.Invoke(graph, Array.Empty<object>());
+                    }
+                    else
+                    {
+                         node = gen.Invoke(graph, new object[] { Vector2.zero });
+                    }
+
+                    if (node is PerkRelationNode prn)
+                    {
+                        prn.relatedNode = perk;
+                        return prn;
+                    }
+                }
+                else
+                {
+                    Debug.LogError("[SuperStorageMod] Failed to find Graph.AddNode generic method.");
                 }
             }
             catch (Exception ex)
@@ -253,42 +308,6 @@ namespace SuperStorageMod
                 Debug.LogException(ex);
             }
             return null;
-        }
-
-        private static void CreateConnection(PerkRelationNode from, PerkRelationNode to)
-        {
-            try
-            {
-                // 查找 NodeCanvas.Framework.Connection 类型
-                // 由于 NodeCanvas 可能在单独的程序集中，不能直接从 PerkRelationNode 的程序集获取
-                var nodeType = from.GetType();
-                while (nodeType != null && nodeType.Name != "Node")
-                {
-                    nodeType = nodeType.BaseType;
-                }
-                if (nodeType == null) return;
-
-                var connType = nodeType.Assembly.GetType("NodeCanvas.Framework.Connection");
-                if (connType == null) return;
-
-                var methods = connType.GetMethods(BindingFlags.Public | BindingFlags.Static);
-                var create = methods.FirstOrDefault(m => m.Name == "Create" && m.GetParameters().Length >= 2);
-                if (create == null) return;
-                var ps = create.GetParameters();
-                if (ps.Length == 2)
-                {
-                    create.Invoke(null, new object[] { from, to });
-                }
-                else
-                {
-                    // 使用 from.outConnectionType 获取连接类型，比直接 typeof 更安全
-                    create.Invoke(null, new object[] { from, to, from.outConnectionType });
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogException(ex);
-            }
         }
 
         private static void SetPrivate(object target, string field, object value)
