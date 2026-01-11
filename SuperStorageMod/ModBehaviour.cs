@@ -57,6 +57,12 @@ namespace SuperStorageMod
         private void OnDisable()
         {
             LevelManager.OnLevelInitialized -= OnLevelInitialized;
+            // 保存当前解锁状态，确保下次启用时能正确恢复
+            var tree = FindStoragePerkTree();
+            if (tree != null)
+            {
+                SaveUnlockedBackupToDisk(tree);
+            }
         }
 
         private void OnLevelInitialized()
@@ -191,7 +197,6 @@ namespace SuperStorageMod
             }
 
             tree.Load();
-            SaveUnlockedBackupToDisk(tree);
             PlayerStorage.NotifyCapacityDirty();
         }
 
