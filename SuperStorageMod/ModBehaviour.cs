@@ -12,12 +12,30 @@ using UnityEngine;
 
 namespace SuperStorageMod
 {
+    /// <summary>
+    /// 超级仓库模组主行为类，用于在技能树中添加仓库扩容等级
+    /// </summary>
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
-        private const int SMALL_BOX_ID = 50; // 小扩容箱
-        private const int MED_BOX_ID = 49;   // 中扩容箱
-        private const int BIG_BOX_ID = 48;   // 大扩容箱
+        private const int SMALL_BOX_ID = 50; 
+        private const int MED_BOX_ID = 49;   
+        private const int BIG_BOX_ID = 48;   
+        private const int INJECT_DELAY_SECONDS = 1; 
+        private const int BUFFER_GUARD_COUNT = 128; 
+        private const float DEFAULT_NODE_SPACING = 6f; 
+        private const float MIN_NODE_SPACING = 5f; 
+        private const int BASE_STORAGE_MIN_CAP = 90; 
+        private const int BASE_STORAGE_MAX_CAP = 110; 
+        private const float TOLERANCE_X = 1f; 
+        private const float MIN_DELTA_THRESHOLD = 0.1f; 
+        private const string PERK_NAME_PREFIX = "SuperStorage_"; 
+        private const string BACKUP_DIR_NAME = "SuperStorageMod"; 
+        private const string BACKUP_FILE_PREFIX = "backup_slot_"; 
+        private const string UNKNOWN_TREE_ID = "UnknownTree";
 
+        /// <summary>
+        /// 仓库扩容等级配置数组
+        /// </summary>
         private readonly (string nameKey, string displayName, int addCap, int requireLevel, long money, (int id, int amount)[] items)[] tiers = new[]
         {
             ("SuperStorage_Lv2",  "超级仓库Lv.2", 150, 30, 600_000L, new[]{ (SMALL_BOX_ID,9),  (MED_BOX_ID,6),  (BIG_BOX_ID,3) }),
@@ -31,6 +49,9 @@ namespace SuperStorageMod
             ("SuperStorage_Lv10", "超级仓库Lv.10",600, 40, 2_000_000L, new[]{ (SMALL_BOX_ID,33), (MED_BOX_ID,22), (BIG_BOX_ID,11) })
         };
 
+        /// <summary>
+        /// 模组唤醒时调用，设置本地化文本
+        /// </summary>
         private void Awake()
         {
             Debug.Log("[SuperStorageMod] Awake started.");
@@ -48,12 +69,18 @@ namespace SuperStorageMod
             }
         }
 
+        /// <summary>
+        /// 模组启用时调用，订阅关卡初始化事件
+        /// </summary>
         private void OnEnable()
         {
             LevelManager.OnLevelInitialized += OnLevelInitialized;
             Debug.Log("[SuperStorageMod] OnEnable: Subscribed to OnLevelInitialized.");
         }
 
+        /// <summary>
+        /// 模组禁用时调用，取消订阅事件并保存解锁状态
+        /// </summary>
         private void OnDisable()
         {
             LevelManager.OnLevelInitialized -= OnLevelInitialized;
@@ -65,19 +92,25 @@ namespace SuperStorageMod
             }
         }
 
+        /// <summary>
+        /// 关卡初始化时调用，开始注入逻辑
+        /// </summary>
         private void OnLevelInitialized()
         {
             Debug.Log("[SuperStorageMod] OnLevelInitialized started.");
             Inject().Forget();
         }
 
+        /// <summary>
+        /// 主注入函数，处理缓存物品并添加仓库扩容技能
+        /// </summary>
         private async UniTaskVoid Inject()
         {
             try
             {
                 Debug.Log("[SuperStorageMod] Injecting... Waiting for level load to settle.");
                 // 增加延迟，确保 Level Initialization 完全结束，避免与 SetCharacterPosition 等逻辑冲突
-                await UniTask.Delay(System.TimeSpan.FromSeconds(1)); 
+                await UniTask.Delay(System.TimeSpan.FromSeconds(INJECT_DELAY_SECONDS)); 
                 
                 Debug.Log("[SuperStorageMod] Starting DrainBufferToStorage...");
                 // 1. 处理缓存物品
@@ -107,6 +140,10 @@ namespace SuperStorageMod
             }
         }
 
+        /// <summary>
+        /// 内部注入函数，向技能树添加仓库扩容节点
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
         private void InjectInternal(PerkTree tree)
         {
             var basePerk = FindBaseStoragePerk(tree);
@@ -200,6 +237,10 @@ namespace SuperStorageMod
             PlayerStorage.NotifyCapacityDirty();
         }
 
+        /// <summary>
+        /// 查找仓库技能树
+        /// </summary>
+        /// <returns>仓库技能树对象，找不到返回null</returns>
         private PerkTree? FindStoragePerkTree()
         {
             var trees = PerkTreeManager.Instance?.perkTrees;
@@ -210,15 +251,22 @@ namespace SuperStorageMod
             if (byComponent != null) return byComponent;
 
             // 其次尝试通过 ID 查找（假设官方 ID 不变）
-            var byID = trees.FirstOrDefault(t => t != null && (t.ID == "Main" || t.ID == "PerkTree_Main")); // 示例 ID，实际可能不同
+            var byID = trees.FirstOrDefault(t => t != null && (t.ID == "Main" || t.ID == "PerkTree_Main")); // 示例ID，实际可能不同
             if (byID != null) return byID;
 
             // 最后尝试通过名称查找
             return trees.FirstOrDefault(t => t != null && (t.DisplayName.Contains("仓库") || t.DisplayName.Contains("Storage")));
         }
 
+        /// <summary>
+        /// 查找基础仓库技能节点
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <returns>基础仓库技能节点</returns>
         private static Perk? FindBaseStoragePerk(PerkTree tree)
         {
+            if (tree == null) return null;
+            
             var candidates = tree.Perks.Where(p => p != null && p.GetComponent<AddPlayerStorage>() != null).ToList();
             if (candidates.Count == 0) return null;
 
@@ -229,7 +277,7 @@ namespace SuperStorageMod
                 var fi = typeof(AddPlayerStorage).GetField("addCapacity", BindingFlags.Instance | BindingFlags.NonPublic);
                 if (fi == null) return false;
                 var v = fi.GetValue(add);
-                return v is int i && i >= 90 && i <= 110;
+                return v is int i && i >= BASE_STORAGE_MIN_CAP && i <= BASE_STORAGE_MAX_CAP;
             });
             if (byCap100 != null) return byCap100;
 
@@ -240,11 +288,22 @@ namespace SuperStorageMod
             return candidates.First();
         }
 
+        /// <summary>
+        /// 检查技能树是否已包含指定等级
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <param name="nameKey">等级名称键</param>
+        /// <returns>是否已包含</returns>
         private bool TreeAlreadyHasTier(PerkTree tree, string nameKey)
         {
             return tree.Perks.Any(p => p != null && p.DisplayNameRaw == nameKey);
         }
 
+        /// <summary>
+        /// 向技能树添加技能节点
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <param name="perk">技能节点</param>
         private static void AddPerkToTree(PerkTree tree, Perk perk)
         {
             var fi = typeof(PerkTree).GetField("perks", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -252,6 +311,12 @@ namespace SuperStorageMod
             if (list != null && !list.Contains(perk)) list.Add(perk);
         }
 
+        /// <summary>
+        /// 向关系图添加节点
+        /// </summary>
+        /// <param name="graph">关系图对象</param>
+        /// <param name="perk">技能节点</param>
+        /// <returns>关系图节点</returns>
         private static PerkRelationNode? AddGraphNode(object graph, Perk perk)
         {
             try
@@ -273,13 +338,13 @@ namespace SuperStorageMod
                     {
                         // AddNode<T>()
                         addNodeMethod = m;
-                        break;
+                        // break; // 移除以允许回退到 AddNode<T>(Vector2)（如果可用）
                     }
                     if (parameters.Length == 1 && parameters[0].ParameterType == typeof(Vector2))
                     {
-                        // AddNode<T>(Vector2) - 优先使用带坐标的版本，设为 0
+                        // AddNode<T>(Vector2) - 优先使用带坐标的版本，设为0
                         addNodeMethod = m;
-                        // 不 break，继续看有没有无参的，或者就用这个
+                        // 不break，继续看有没有无参的，或者就用这个
                     }
                 }
 
@@ -315,12 +380,25 @@ namespace SuperStorageMod
             return null;
         }
 
+        /// <summary>
+        /// 设置对象的私有字段值
+        /// </summary>
+        /// <param name="target">目标对象</param>
+        /// <param name="field">字段名</param>
+        /// <param name="value">字段值</param>
         private static void SetPrivate(object target, string field, object value)
         {
             var fi = target.GetType().GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             fi?.SetValue(target, value);
         }
 
+        /// <summary>
+        /// 获取对象的私有字段值
+        /// </summary>
+        /// <typeparam name="T">字段类型</typeparam>
+        /// <param name="target">目标对象</param>
+        /// <param name="field">字段名</param>
+        /// <returns>字段值</returns>
         [return: MaybeNull]
         private static T GetPrivate<T>(object target, string field)
         {
@@ -328,6 +406,12 @@ namespace SuperStorageMod
             return fi != null ? (T)fi.GetValue(target) : default;
         }
 
+        /// <summary>
+        /// 获取对象的私有长整型字段值
+        /// </summary>
+        /// <param name="target">目标对象</param>
+        /// <param name="field">字段名</param>
+        /// <returns>字段值</returns>
         private static long GetPrivateLong(object target, string field)
         {
             var fi = target.GetType().GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
@@ -337,9 +421,26 @@ namespace SuperStorageMod
             return 0L;
         }
 
-        private static (float extremeY, float step, float downSign) MeasureColumn(PerkTree tree, PerkRelationNode baseNode, float toleranceX = 1f)
+        /// <summary>
+        /// 测量技能树列的属性，包括极值Y坐标、步长和方向符号
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <param name="baseNode">基础节点</param>
+        /// <param name="toleranceX">X轴容差</param>
+        /// <returns>包含极值Y、步长和方向符号的元组</returns>
+        private static (float extremeY, float step, float downSign) MeasureColumn(PerkTree tree, PerkRelationNode baseNode, float toleranceX = TOLERANCE_X)
         {
-            var graph = tree.RelationGraphOwner.RelationGraph;
+            if (tree == null || baseNode == null)
+            {
+                return (0f, DEFAULT_NODE_SPACING, -1f);
+            }
+
+            var graph = tree.RelationGraphOwner?.RelationGraph;
+            if (graph == null)
+            {
+                return (baseNode.cachedPosition.y, DEFAULT_NODE_SPACING, -1f);
+            }
+
             float baseX = baseNode.cachedPosition.x;
             float minY = baseNode.cachedPosition.y;
             float maxY = baseNode.cachedPosition.y;
@@ -348,6 +449,7 @@ namespace SuperStorageMod
             var visited = new System.Collections.Generic.HashSet<PerkRelationNode>();
             q.Enqueue(baseNode);
             visited.Add(baseNode);
+            
             while (q.Count > 0)
             {
                 var n = q.Dequeue();
@@ -359,11 +461,12 @@ namespace SuperStorageMod
                         minY = Mathf.Min(minY, child.cachedPosition.y);
                         maxY = Mathf.Max(maxY, child.cachedPosition.y);
                         var d = child.cachedPosition.y - n.cachedPosition.y;
-                        if (Mathf.Abs(d) > 0.1f) deltas.Add(d);
+                        if (Mathf.Abs(d) > MIN_DELTA_THRESHOLD) deltas.Add(d);
                     }
                     q.Enqueue(child);
                 }
             }
+            
             float avgDelta = deltas.Count > 0 ? deltas.Average() : -4.0f;
             float downSign = avgDelta < 0 ? -1f : 1f;
             float step = deltas.Count > 0 ? deltas.Select(Mathf.Abs).Max() : Mathf.Abs(avgDelta);
@@ -371,45 +474,82 @@ namespace SuperStorageMod
             return (extremeY, step, downSign);
         }
 
+        /// <summary>
+        /// 根据显示名称查找技能节点
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <param name="contains">包含的字符串</param>
+        /// <returns>找到的技能节点，找不到返回null</returns>
         private static Perk? FindPerkByName(PerkTree tree, string contains)
         {
+            if (tree == null || string.IsNullOrEmpty(contains)) return null;
             return tree.Perks.FirstOrDefault(p => p != null && (p.DisplayName ?? string.Empty).Contains(contains));
         }
 
+        /// <summary>
+        /// 根据原始名称查找技能节点
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <param name="raw">原始名称</param>
+        /// <returns>找到的技能节点，找不到返回null</returns>
         private static Perk? FindPerkByRawName(PerkTree tree, string raw)
         {
+            if (tree == null || string.IsNullOrEmpty(raw)) return null;
             return tree.Perks.FirstOrDefault(p => p != null && p.DisplayNameRaw == raw);
         }
 
+        /// <summary>
+        /// 计算节点的水平间距
+        /// </summary>
+        /// <param name="anchor">锚点节点</param>
+        /// <param name="tree">技能树对象</param>
+        /// <returns>水平间距</returns>
         private static float ComputeDx(PerkRelationNode anchor, PerkTree tree)
         {
-            var graph = tree.RelationGraphOwner.RelationGraph;
+            if (anchor == null || tree == null) return DEFAULT_NODE_SPACING;
+
+            var graph = tree.RelationGraphOwner?.RelationGraph;
+            if (graph == null) return DEFAULT_NODE_SPACING;
+
             var nodes = graph.GetIncomingNodes(anchor).Concat(graph.GetOutgoingNodes(anchor)).ToList();
             float baseX = anchor.cachedPosition.x;
-            var diffs = nodes.Where(n => n != null).Select(n => Mathf.Abs(n.cachedPosition.x - baseX)).Where(d => d > 0.1f).ToList();
-            float dx = diffs.Count > 0 ? diffs.Average() : 6f;
-            return Mathf.Max(dx, 5f);
+            var diffs = nodes.Where(n => n != null).Select(n => Mathf.Abs(n.cachedPosition.x - baseX)).Where(d => d > MIN_DELTA_THRESHOLD).ToList();
+            float dx = diffs.Count > 0 ? diffs.Average() : DEFAULT_NODE_SPACING;
+            return Mathf.Max(dx, MIN_NODE_SPACING);
         }
 
+        /// <summary>
+        /// 计算节点的向上垂直间距
+        /// </summary>
+        /// <param name="anchor">锚点节点</param>
+        /// <param name="tree">技能树对象</param>
+        /// <returns>垂直间距</returns>
         private static float ComputeDyUp(PerkRelationNode anchor, PerkTree tree)
         {
-            var graph = tree.RelationGraphOwner.RelationGraph;
+            if (anchor == null || tree == null) return DEFAULT_NODE_SPACING;
+
+            var graph = tree.RelationGraphOwner?.RelationGraph;
+            if (graph == null) return DEFAULT_NODE_SPACING;
+
             var nodes = graph.GetIncomingNodes(anchor).ToList();
             float baseY = anchor.cachedPosition.y;
             var diffs = nodes.Where(n => n != null).Select(n => n.cachedPosition.y - baseY).ToList();
-            if (diffs.Count == 0) return 6f;
+            if (diffs.Count == 0) return DEFAULT_NODE_SPACING;
             float avg = diffs.Average();
             float sign = avg < 0 ? -1f : 1f; 
             float mag = diffs.Select(d => Mathf.Abs(d)).Max();
-            mag = Mathf.Max(mag, 6f);
+            mag = Mathf.Max(mag, DEFAULT_NODE_SPACING);
             return sign * mag;
         }
 
+        /// <summary>
+        /// 将缓存物品转移到仓库
+        /// </summary>
         private static async UniTask DrainBufferToStorage()
         {
             var buf = PlayerStorage.IncomingItemBuffer;
             if (buf == null) return;
-            int guard = 128;
+            int guard = BUFFER_GUARD_COUNT;
             while (buf.Count > 0 && guard-- > 0)
             {
                 int idx = buf.Count - 1;
@@ -429,17 +569,30 @@ namespace SuperStorageMod
             }
         }
 
+        /// <summary>
+        /// 模组解锁状态监视组件
+        /// </summary>
         private class ModUnlockWatcher : MonoBehaviour
         {
             private PerkTree? tree;
             private Perk? perk;
             private bool last;
+            
+            /// <summary>
+            /// 初始化监视组件
+            /// </summary>
+            /// <param name="t">技能树对象</param>
+            /// <param name="p">技能节点</param>
             public void Init(PerkTree t, Perk p)
             {
                 tree = t;
                 perk = p;
                 last = perk != null && perk.Unlocked;
             }
+            
+            /// <summary>
+            /// 每帧更新，检查解锁状态变化
+            /// </summary>
             private void Update()
             {
                 var cur = perk != null && perk.Unlocked;
@@ -455,8 +608,15 @@ namespace SuperStorageMod
             }
         }
 
+        /// <summary>
+        /// 获取技能树ID
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
+        /// <returns>技能树ID</returns>
         private static string GetTreeID(PerkTree tree)
         {
+            if (tree == null) return UNKNOWN_TREE_ID;
+            
             var tp = typeof(PerkTree);
             var pi = tp.GetProperty("ID", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             if (pi != null)
@@ -470,10 +630,15 @@ namespace SuperStorageMod
                 var v = fi.GetValue(tree) as string;
                 if (!string.IsNullOrEmpty(v)) return v;
             }
-            var name = tree != null ? tree.name : string.Empty;
-            return string.IsNullOrEmpty(name) ? "UnknownTree" : name;
+            var name = tree.name;
+            return string.IsNullOrEmpty(name) ? UNKNOWN_TREE_ID : name;
         }
 
+        /// <summary>
+        /// 通过简单名称查找类型
+        /// </summary>
+        /// <param name="name">类型名称</param>
+        /// <returns>类型对象</returns>
         private static Type? FindTypeBySimpleName(string name)
         {
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -488,6 +653,10 @@ namespace SuperStorageMod
             return null;
         }
 
+        /// <summary>
+        /// 获取当前存档槽位
+        /// </summary>
+        /// <returns>存档槽位编号</returns>
         private static int GetCurrentSlot()
         {
             var t = FindTypeBySimpleName("SavesSystem");
@@ -500,32 +669,52 @@ namespace SuperStorageMod
             return 1;
         }
 
+        /// <summary>
+        /// 获取备份目录路径
+        /// </summary>
+        /// <returns>备份目录路径</returns>
         private static string GetBackupDir()
         {
-            var dir = Path.Combine(Application.persistentDataPath, "SuperStorageMod");
+            var dir = Path.Combine(Application.persistentDataPath, BACKUP_DIR_NAME);
             try { if (!Directory.Exists(dir)) Directory.CreateDirectory(dir); } catch { }
             return dir;
         }
 
+        /// <summary>
+        /// 获取备份文件路径
+        /// </summary>
+        /// <returns>备份文件路径</returns>
         private static string GetBackupPath()
         {
             int slot = GetCurrentSlot();
-            return Path.Combine(GetBackupDir(), $"backup_slot_{slot}.txt");
+            return Path.Combine(GetBackupDir(), $"{BACKUP_FILE_PREFIX}{slot}.txt");
         }
 
+        /// <summary>
+        /// 保存解锁状态备份到磁盘
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
         private static void SaveUnlockedBackupToDisk(PerkTree tree)
         {
+            if (tree == null) return;
+            
             try
             {
-                var ids = tree.Perks.Where(p => p != null && (p.DisplayNameRaw ?? string.Empty).StartsWith("SuperStorage_") && p.Unlocked)
+                var ids = tree.Perks.Where(p => p != null && (p.DisplayNameRaw ?? string.Empty).StartsWith(PERK_NAME_PREFIX) && p.Unlocked)
                     .Select(p => p.gameObject.name).ToArray();
                 File.WriteAllLines(GetBackupPath(), ids);
             }
             catch { }
         }
 
+        /// <summary>
+        /// 从磁盘恢复解锁状态
+        /// </summary>
+        /// <param name="tree">技能树对象</param>
         private static void RestoreUnlockedFromDisk(PerkTree tree)
         {
+            if (tree == null) return;
+            
             var path = GetBackupPath();
             if (!File.Exists(path)) return;
             string[]? lines = null;
@@ -544,7 +733,7 @@ namespace SuperStorageMod
 
             foreach (var p in tree.Perks)
             {
-                if (p == null || !set.Contains(p.gameObject.name)) continue;
+                if (p == null || p.gameObject == null || !set.Contains(p.gameObject.name)) continue;
                 
                 try
                 {
@@ -556,7 +745,7 @@ namespace SuperStorageMod
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"[SuperStorageMod] Failed to restore perk {p.gameObject.name}: {ex}");
+                    Debug.LogError($"[SuperStorageMod] Failed to restore perk {p.gameObject?.name ?? "Unknown"}: {ex}");
                 }
             }
         }
