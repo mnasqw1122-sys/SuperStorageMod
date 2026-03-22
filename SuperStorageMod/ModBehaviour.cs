@@ -114,8 +114,11 @@ namespace SuperStorageMod
                 
                 Debug.Log("[SuperStorageMod] Starting DrainBufferToStorage...");
                 // 1. 处理缓存物品
-                await DrainBufferToStorage();
-                Debug.Log("[SuperStorageMod] DrainBufferToStorage finished.");
+                // 修复：禁用自动提取功能。
+                // 原有的逻辑会自动将“马蜂自提点”（Express Cabinet）的物品移动到仓库/背包。
+                // 这导致玩家误以为物品丢失（其实是进了背包），或者在背包满时可能导致物品真正丢失。
+                // await DrainBufferToStorage(); 
+                Debug.Log("[SuperStorageMod] DrainBufferToStorage skipped (Fixed).");
                 
                 // 2. 查找技能树
                 var tree = FindStoragePerkTree();
