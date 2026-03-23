@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Diagnostics.CodeAnalysis;
@@ -6,14 +7,16 @@ using System.IO;
 using Cysharp.Threading.Tasks;
 using Duckov.Modding;
 using Duckov.PerkTrees;
+using Duckov.PerkTrees.Interactable;
 using Duckov.Economy;
 using SodaCraft.Localizations;
 using UnityEngine;
+using NodeCanvas.Framework;
 
 namespace SuperStorageMod
 {
     /// <summary>
-    /// 超级仓库模组主行为类，用于在技能树中添加仓库扩容等级
+    /// 超级仓库模组主行为类，全新重置版：独立技能树，独立UI入口，不再干涉官方节点
     /// </summary>
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
@@ -21,17 +24,14 @@ namespace SuperStorageMod
         private const int MED_BOX_ID = 49;   
         private const int BIG_BOX_ID = 48;   
         private const int INJECT_DELAY_SECONDS = 1; 
-        private const int BUFFER_GUARD_COUNT = 128; 
-        private const float DEFAULT_NODE_SPACING = 6f; 
-        private const float MIN_NODE_SPACING = 5f; 
-        private const int BASE_STORAGE_MIN_CAP = 90; 
-        private const int BASE_STORAGE_MAX_CAP = 110; 
-        private const float TOLERANCE_X = 1f; 
-        private const float MIN_DELTA_THRESHOLD = 0.1f; 
         private const string PERK_NAME_PREFIX = "SuperStorage_"; 
         private const string BACKUP_DIR_NAME = "SuperStorageMod"; 
         private const string BACKUP_FILE_PREFIX = "backup_slot_"; 
-        private const string UNKNOWN_TREE_ID = "UnknownTree";
+        
+        // 我们自己的独立技能树ID
+        private const string CUSTOM_TREE_ID = "SuperStorageExpand";
+        // 交互按钮的名称键
+        private const string CUSTOM_INTERACT_KEY = "SuperStorage_InteractName";
 
         /// <summary>
         /// 仓库扩容等级配置数组
@@ -49,18 +49,21 @@ namespace SuperStorageMod
             ("SuperStorage_Lv10", "超级仓库Lv.10",600, 40, 2_000_000L, new[]{ (SMALL_BOX_ID,33), (MED_BOX_ID,22), (BIG_BOX_ID,11) })
         };
 
-        /// <summary>
-        /// 模组唤醒时调用，设置本地化文本
-        /// </summary>
         private void Awake()
         {
             Debug.Log("[SuperStorageMod] Awake started.");
             try
             {
+                // 注册各等级名称
                 foreach (var t in tiers)
                 {
                     LocalizationManager.SetOverrideText(t.nameKey, t.displayName);
                 }
+                
+                // 注册独立技能树和按钮的名称
+                LocalizationManager.SetOverrideText("PerkTree_" + CUSTOM_TREE_ID, "超库扩容");
+                LocalizationManager.SetOverrideText(CUSTOM_INTERACT_KEY, "超库扩容");
+                
                 Debug.Log("[SuperStorageMod] Localization set.");
             }
             catch (Exception ex)
@@ -69,71 +72,55 @@ namespace SuperStorageMod
             }
         }
 
-        /// <summary>
-        /// 模组启用时调用，订阅关卡初始化事件
-        /// </summary>
         private void OnEnable()
         {
             LevelManager.OnLevelInitialized += OnLevelInitialized;
             Debug.Log("[SuperStorageMod] OnEnable: Subscribed to OnLevelInitialized.");
         }
 
-        /// <summary>
-        /// 模组禁用时调用，取消订阅事件并保存解锁状态
-        /// </summary>
         private void OnDisable()
         {
             LevelManager.OnLevelInitialized -= OnLevelInitialized;
-            // 保存当前解锁状态，确保下次启用时能正确恢复
-            var tree = FindStoragePerkTree();
+            var tree = PerkTreeManager.GetPerkTree(CUSTOM_TREE_ID);
             if (tree != null)
             {
                 SaveUnlockedBackupToDisk(tree);
             }
         }
 
-        /// <summary>
-        /// 关卡初始化时调用，开始注入逻辑
-        /// </summary>
         private void OnLevelInitialized()
         {
             Debug.Log("[SuperStorageMod] OnLevelInitialized started.");
             Inject().Forget();
         }
 
-        /// <summary>
-        /// 主注入函数，处理缓存物品并添加仓库扩容技能
-        /// </summary>
         private async UniTaskVoid Inject()
         {
             try
             {
                 Debug.Log("[SuperStorageMod] Injecting... Waiting for level load to settle.");
-                // 增加延迟，确保 Level Initialization 完全结束，避免与 SetCharacterPosition 等逻辑冲突
-                await UniTask.Delay(System.TimeSpan.FromSeconds(INJECT_DELAY_SECONDS)); 
+                await UniTask.Delay(TimeSpan.FromSeconds(INJECT_DELAY_SECONDS)); 
                 
-                Debug.Log("[SuperStorageMod] Starting DrainBufferToStorage...");
-                // 1. 处理缓存物品
-                // 修复：禁用自动提取功能。
-                // 原有的逻辑会自动将“马蜂自提点”（Express Cabinet）的物品移动到仓库/背包。
-                // 这导致玩家误以为物品丢失（其实是进了背包），或者在背包满时可能导致物品真正丢失。
-                // await DrainBufferToStorage(); 
-                Debug.Log("[SuperStorageMod] DrainBufferToStorage skipped (Fixed).");
-                
-                // 2. 查找技能树
-                var tree = FindStoragePerkTree();
-                if (tree == null)
+                var officialTree = PerkTreeManager.GetPerkTree("StorageExpand");
+                if (officialTree == null)
                 {
-                    Debug.LogWarning("[SuperStorageMod] Storage PerkTree not found! Mod will not function.");
+                    Debug.LogWarning("[SuperStorageMod] Official StorageExpand tree not found! Cannot copy base data.");
                     return;
                 }
-                Debug.Log($"[SuperStorageMod] Found existing PerkTree: {tree.name} (ID: {tree.ID})");
 
-                // 3. 继续原有逻辑
-                InjectInternal(tree);
+                // 1. 创建我们自己的独立技能树
+                var myTree = PerkTreeManager.GetPerkTree(CUSTOM_TREE_ID);
+                if (myTree == null)
+                {
+                    myTree = CreateCustomPerkTree(officialTree);
+                    if (myTree == null) return;
+                }
 
-                // 4. 恢复解锁状态
-                RestoreUnlockedFromDisk(tree);
+                // 2. 恢复解锁状态
+                RestoreUnlockedFromDisk(myTree);
+                
+                // 3. 在场景中注入我们的交互入口
+                InjectInvokerIntoScene();
                 
                 Debug.Log("[SuperStorageMod] Injection complete.");
             }
@@ -144,236 +131,304 @@ namespace SuperStorageMod
         }
 
         /// <summary>
-        /// 内部注入函数，向技能树添加仓库扩容节点
+        /// 创建完全独立的技能树
         /// </summary>
-        /// <param name="tree">技能树对象</param>
-        private void InjectInternal(PerkTree tree)
+        private PerkTree? CreateCustomPerkTree(PerkTree officialTree)
         {
-            var basePerk = FindBaseStoragePerk(tree);
-            if (basePerk == null)
+            Debug.Log("[SuperStorageMod] Creating custom PerkTree...");
+            
+            var myTreeGo = new GameObject("PerkTree_" + CUSTOM_TREE_ID);
+            myTreeGo.transform.SetParent(PerkTreeManager.Instance.transform);
+            
+            var myTree = myTreeGo.AddComponent<PerkTree>();
+            SetPrivate(myTree, "perkTreeID", CUSTOM_TREE_ID);
+            
+            // 尝试创建图所有者
+            var ownerType = FindTypeBySimpleName("PerkTreeRelationGraphOwner");
+            if (ownerType == null)
             {
-                 Debug.LogWarning("[SuperStorageMod] Base storage perk not found.");
-                 return;
+                Debug.LogError("[SuperStorageMod] PerkTreeRelationGraphOwner type not found!");
+                return null;
             }
-
-            // 确保找到的是有效的 RelationNode
-            var baseNode = tree.RelationGraphOwner.RelationGraph.GetRelatedNode(basePerk);
-            if (baseNode == null) 
+            var owner = myTreeGo.AddComponent(ownerType);
+            
+            // 创建图数据对象
+            var graphType = FindTypeBySimpleName("PerkRelationGraph");
+            if (graphType == null) return null;
+            var graph = ScriptableObject.CreateInstance(graphType) as Graph;
+            
+            // 赋值给图所有者
+            var propGraph = ownerType.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) 
+                         ?? ownerType.BaseType?.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (propGraph != null && graph != null)
             {
-                Debug.LogWarning($"[SuperStorageMod] Related node for base perk {basePerk.name} not found.");
-                return;
+                propGraph.SetValue(owner, graph);
             }
+            
+            SetPrivate(myTree, "relationGraphOwner", owner);
+            
+            // 获取官方基础数据（如图标，时间）
+            var basePerk = officialTree.Perks.FirstOrDefault(p => p != null && p.GetComponent<AddPlayerStorage>() != null);
+            var icon = basePerk?.Icon;
+            var quality = basePerk != null ? basePerk.DisplayQuality : default;
+            var requireTimeTicks = basePerk != null ? GetPrivateLong(basePerk.Requirement, "requireTime") : 0L;
 
-            var requireTimeTicks = GetPrivateLong(basePerk.Requirement, "requireTime");
-            var icon = basePerk.Icon;
-            var quality = basePerk.DisplayQuality;
-
-            var graph = tree.RelationGraphOwner.graph;
-
-            // 将新增节点放到官方空白区域并分别挂载到指定节点
-            var placements = new (string anchorRawName, System.Func<PerkRelationNode, Vector2> offsetFn, int tierIndex)[]
+            // 动态生成节点
+            for (int i = 0; i < tiers.Length; i++)
             {
-                ("Perk_Storage_1", n => new Vector2(-60f - n.cachedPosition.x, 200f - n.cachedPosition.y), 0),
-                ("Perk_Storage_2", n => new Vector2(-60f - n.cachedPosition.x, 300f - n.cachedPosition.y), 1),
-                ("Perk_Storage_3", n => new Vector2(-60f - n.cachedPosition.x, 400f - n.cachedPosition.y), 2),
-                ("Perk_Storage_4", n => new Vector2(-60f - n.cachedPosition.x, 500f - n.cachedPosition.y), 3),
-                ("Perk_Storage_y_5", n => new Vector2(120f - n.cachedPosition.x, 900f - n.cachedPosition.y), 4),
-                ("Perk_Storage_y_5", n => new Vector2(120f - n.cachedPosition.x, 820f - n.cachedPosition.y), 5),
-                ("Perk_Storage_y_5", n => new Vector2(30f - n.cachedPosition.x, 820f - n.cachedPosition.y), 6),
-                ("Perk_Storage_y_5", n => new Vector2(-60f - n.cachedPosition.x, 1040f - n.cachedPosition.y), 7),
-                ("Perk_Storage_y_5", n => new Vector2(300f - n.cachedPosition.x, 1040f - n.cachedPosition.y), 8),
-            };
-
-            foreach (var p in placements)
-            {
-                var tier = tiers[p.tierIndex];
-                if (TreeAlreadyHasTier(tree, tier.nameKey)) continue;
-
-                var anchor = FindPerkByRawName(tree, p.anchorRawName);
-                if (anchor == null) 
-                {
-                    // 尝试用 basePerk 作为备用锚点，如果指定的锚点找不到
-                    anchor = basePerk;
-                }
-                
-                var anchorNode = tree.RelationGraphOwner.RelationGraph.GetRelatedNode(anchor);
-                if (anchorNode == null) continue;
-
+                var tier = tiers[i];
                 var perkGO = new GameObject($"SuperStorageMod_{tier.nameKey}");
-                perkGO.transform.SetParent(tree.transform);
+                perkGO.transform.SetParent(myTree.transform);
                 var perk = perkGO.AddComponent<Perk>();
-
-                SetPrivate(perk, "master", tree);
+                
+                SetPrivate(perk, "master", myTree);
                 SetPrivate(perk, "icon", icon);
                 SetPrivate(perk, "quality", quality);
                 SetPrivate(perk, "displayName", tier.nameKey);
                 SetPrivate(perk, "hasDescription", true);
                 SetPrivate(perk, "defaultUnlocked", false);
-
-                var req = new PerkRequirement
+                
+                var reqType = FindTypeBySimpleName("PerkRequirement");
+                object? req = null;
+                if (reqType != null)
                 {
-                    level = tier.requireLevel,
-                    cost = new Cost(tier.money, tier.items.Select(e => ((int)e.id, (long)e.amount)).ToArray()),
-                    requireTime = requireTimeTicks
-                };
+                    req = Activator.CreateInstance(reqType);
+                    reqType.GetField("level")?.SetValue(req, tier.requireLevel);
+                    var costType = FindTypeBySimpleName("Cost");
+                    if (costType != null)
+                    {
+                        var itemsArr = tier.items.Select(e => ((int)e.id, (long)e.amount)).ToArray();
+                        object? cost = Activator.CreateInstance(costType, tier.money, itemsArr);
+                        reqType.GetField("cost")?.SetValue(req, cost);
+                    }
+                    reqType.GetField("requireTime")?.SetValue(req, requireTimeTicks);
+                }
                 SetPrivate(perk, "requirement", req);
-
+                
                 var add = perkGO.AddComponent<AddPlayerStorage>();
                 SetPrivate(add, "addCapacity", tier.addCap);
-
+                
                 var watcher = perkGO.AddComponent<ModUnlockWatcher>();
-                watcher.Init(tree, perk);
-
-                AddPerkToTree(tree, perk);
+                watcher.Init(myTree, perk);
+                
+                AddPerkToTree(myTree, perk);
+                
                 var node = AddGraphNode(graph, perk);
-                if (node == null) 
+                if (node != null) 
                 {
-                    Debug.LogError($"[SuperStorageMod] Failed to add graph node for {tier.nameKey}");
-                    continue;
+                    // 将节点纵向排列，官方UI会自动适应边界
+                    node.cachedPosition = new Vector2(0, i * 150f);
                 }
-                var offset = p.offsetFn(anchorNode);
-                node.cachedPosition = anchorNode.cachedPosition + offset;
-                // 不与官方节点建立连接，保持完全独立
             }
-
-            tree.Load();
-            PlayerStorage.NotifyCapacityDirty();
+            
+            // 将新的技能树注册到全局管理器
+            PerkTreeManager.Instance.perkTrees.Add(myTree);
+            myTree.Load(); // 尝试读取官方存档机制中的数据
+            
+            return myTree;
         }
 
         /// <summary>
-        /// 查找仓库技能树
+        /// 将我们的独立交互入口注入到场景的官方交互组中
         /// </summary>
-        /// <returns>仓库技能树对象，找不到返回null</returns>
-        private PerkTree? FindStoragePerkTree()
+        private void InjectInvokerIntoScene()
         {
-            var trees = PerkTreeManager.Instance?.perkTrees;
-            if (trees == null) return null;
+            Debug.Log("[SuperStorageMod] Injecting Invoker into Scene...");
             
-            // 优先查找包含 AddPlayerStorage 组件的 PerkTree，这更可靠
-            var byComponent = trees.FirstOrDefault(t => t != null && t.Perks.Any(p => p != null && p.GetComponent<AddPlayerStorage>() != null));
-            if (byComponent != null) return byComponent;
-
-            // 其次尝试通过 ID 查找（假设官方 ID 不变）
-            var byID = trees.FirstOrDefault(t => t != null && (t.ID == "Main" || t.ID == "PerkTree_Main")); // 示例ID，实际可能不同
-            if (byID != null) return byID;
-
-            // 最后尝试通过名称查找
-            return trees.FirstOrDefault(t => t != null && (t.DisplayName.Contains("仓库") || t.DisplayName.Contains("Storage")));
-        }
-
-        /// <summary>
-        /// 查找基础仓库技能节点
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <returns>基础仓库技能节点</returns>
-        private static Perk? FindBaseStoragePerk(PerkTree tree)
-        {
-            if (tree == null) return null;
+            var allInvokers = Resources.FindObjectsOfTypeAll<PerkTreeUIInvoker>();
+            var sceneInvokers = allInvokers.Where(inv => inv.perkTreeID == "StorageExpand" && inv.gameObject.scene.IsValid()).ToList();
             
-            var candidates = tree.Perks.Where(p => p != null && p.GetComponent<AddPlayerStorage>() != null).ToList();
-            if (candidates.Count == 0) return null;
-
-            // 优先通过组件数值查找 (90-110 容量的通常是基础包)
-            var byCap100 = candidates.FirstOrDefault(p =>
+            Debug.Log($"[SuperStorageMod] Found {sceneInvokers.Count} official StorageExpand invokers in scene.");
+            
+            if (sceneInvokers.Count == 0) 
             {
-                var add = p.GetComponent<AddPlayerStorage>();
-                var fi = typeof(AddPlayerStorage).GetField("addCapacity", BindingFlags.Instance | BindingFlags.NonPublic);
-                if (fi == null) return false;
-                var v = fi.GetValue(add);
-                return v is int i && i >= BASE_STORAGE_MIN_CAP && i <= BASE_STORAGE_MAX_CAP;
-            });
-            if (byCap100 != null) return byCap100;
+                Debug.LogWarning("[SuperStorageMod] Could not find official StorageExpand invoker in scene.");
+                return;
+            }
+            
+            // 我们为每一个找到的都注入，防止漏掉真正的那个
+            foreach (var officialInvoker in sceneInvokers)
+            {
+                // 停用官方节点，以便我们可以安全地实例化它而不会触发克隆体的Awake
+                bool wasActive = officialInvoker.gameObject.activeSelf;
+                officialInvoker.gameObject.SetActive(false);
 
-            // 其次尝试名称
-            var exactName = candidates.FirstOrDefault(p => (p.DisplayName ?? string.Empty).Contains("超级仓库") || (p.DisplayName ?? string.Empty).Contains("Storage"));
-            if (exactName != null) return exactName;
+                // 复制官方的交互器
+                var myInvokerGo = UnityEngine.Object.Instantiate(officialInvoker.gameObject, officialInvoker.transform.parent);
+                myInvokerGo.name = "SuperStorage_Invoker";
+                
+                var myInvoker = myInvokerGo.GetComponent<PerkTreeUIInvoker>();
+                
+                // 清理可能复制过来的其他组内成员，防止引用错乱并解决 Awake 中的 NullReferenceException
+                SetPrivate(myInvoker, "otherInterablesInGroup", new List<InteractableBase>());
+                myInvoker.interactableGroup = false;
 
-            return candidates.First();
+                myInvoker.perkTreeID = CUSTOM_TREE_ID;
+                myInvoker.overrideInteractName = true;
+                myInvoker._overrideInteractNameKey = CUSTOM_INTERACT_KEY;
+                // 注意：在最新版本中我们直接调用 setter，它会自动设置 overrideInteractName
+                myInvoker.InteractName = CUSTOM_INTERACT_KEY;
+                
+                // 重新激活
+                myInvokerGo.SetActive(wasActive);
+                officialInvoker.gameObject.SetActive(wasActive);
+                
+                // 强制将层级设置为 Interactable，以便射线检测能捕捉到
+                myInvokerGo.layer = LayerMask.NameToLayer("Interactable");
+                
+                // 确保我们注入的交互器能够正常唤醒
+                var awakeMethod = typeof(InteractableBase).GetMethod("Awake", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                if (awakeMethod != null)
+                {
+                    awakeMethod.Invoke(myInvoker, null);
+                }
+
+                // Awake可能会添加一个禁用的Collider，我们需要确保它可用
+                var coll = myInvoker.GetComponent<Collider>();
+                if (coll != null)
+                {
+                    coll.enabled = true;
+                    // 同步官方的碰撞体大小（如果有的话）
+                    var offColl = officialInvoker.GetComponent<Collider>();
+                    if (offColl is BoxCollider myBox && coll is BoxCollider offBox)
+                    {
+                        myBox.center = offBox.center;
+                        myBox.size = offBox.size;
+                    }
+                }
+
+                // 找到包含官方交互器的Master交互组
+                var master = FindMasterInteractable(officialInvoker);
+                if (master != null) 
+                {
+                    var list = GetPrivate<List<InteractableBase>>(master, "otherInterablesInGroup");
+                    if (list != null && !list.Contains(myInvoker)) 
+                    {
+                        list.Add(myInvoker);
+                        
+                        // 手动同步Master的变换和标识状态，因为我们是在运行时动态添加的
+                        myInvoker.transform.position = master.transform.position;
+                        myInvoker.transform.rotation = master.transform.rotation;
+                        myInvoker.interactMarkerOffset = master.interactMarkerOffset;
+                        myInvoker.MarkerActive = false;
+
+                        Debug.Log($"[SuperStorageMod] Successfully injected custom invoker into master group of {master.gameObject.name}.");
+                        
+                        // 强制重置玩家当前的交互目标以刷新UI
+                        ForceRefreshInteractHUD();
+                    }
+                } 
+                else 
+                {
+                    // 如果官方交互器本身没有归属于组，则把它变成一个组
+                    Debug.LogWarning($"[SuperStorageMod] Master interactable not found for {officialInvoker.gameObject.name}, trying to make official invoker a group.");
+                    officialInvoker.interactableGroup = true;
+                    var list = GetPrivate<List<InteractableBase>>(officialInvoker, "otherInterablesInGroup");
+                    if (list == null) 
+                    {
+                        list = new List<InteractableBase>();
+                        SetPrivate(officialInvoker, "otherInterablesInGroup", list);
+                    }
+                    if (!list.Contains(myInvoker)) 
+                    {
+                        list.Add(myInvoker);
+                        myInvoker.transform.position = officialInvoker.transform.position;
+                        myInvoker.transform.rotation = officialInvoker.transform.rotation;
+                        myInvoker.interactMarkerOffset = officialInvoker.interactMarkerOffset;
+                        myInvoker.MarkerActive = false;
+                        
+                        ForceRefreshInteractHUD();
+                    }
+                }
+            }
         }
 
-        /// <summary>
-        /// 检查技能树是否已包含指定等级
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <param name="nameKey">等级名称键</param>
-        /// <returns>是否已包含</returns>
-        private bool TreeAlreadyHasTier(PerkTree tree, string nameKey)
+        private InteractableBase? FindMasterInteractable(InteractableBase target)
         {
-            return tree.Perks.Any(p => p != null && p.DisplayNameRaw == nameKey);
+            var all = Resources.FindObjectsOfTypeAll<InteractableBase>();
+            foreach(var i in all) 
+            {
+                if (!i.gameObject.scene.IsValid()) continue;
+                if (i.interactableGroup) 
+                {
+                    var list = GetPrivate<List<InteractableBase>>(i, "otherInterablesInGroup");
+                    if (list != null && list.Contains(target)) 
+                    {
+                        return i;
+                    }
+                }
+            }
+            return null;
         }
 
-        /// <summary>
-        /// 向技能树添加技能节点
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <param name="perk">技能节点</param>
-        private static void AddPerkToTree(PerkTree tree, Perk perk)
-        {
-            var fi = typeof(PerkTree).GetField("perks", BindingFlags.Instance | BindingFlags.NonPublic);
-            var list = fi.GetValue(tree) as System.Collections.IList;
-            if (list != null && !list.Contains(perk)) list.Add(perk);
-        }
-
-        /// <summary>
-        /// 向关系图添加节点
-        /// </summary>
-        /// <param name="graph">关系图对象</param>
-        /// <param name="perk">技能节点</param>
-        /// <returns>关系图节点</returns>
-        private static PerkRelationNode? AddGraphNode(object graph, Perk perk)
+        private void ForceRefreshInteractHUD()
         {
             try
             {
-                // 查找 Graph.AddNode<T>() 方法
+                var mainChar = LevelManager.Instance?.MainCharacter;
+                if (mainChar != null && mainChar.interactAction != null)
+                {
+                    var currentMaster = mainChar.interactAction.MasterInteractableAround;
+                    // 先置空
+                    mainChar.interactAction.SetInteractableTarget(null);
+                    // 稍微延迟一下或者下一帧再恢复，不过直接置空通常足以让HUD在下一帧Update时重新检测到差异并刷新
+                    if (currentMaster != null)
+                    {
+                        mainChar.interactAction.SetInteractableTarget(currentMaster);
+                    }
+                    Debug.Log("[SuperStorageMod] Force refreshed InteractHUD.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod] Failed to force refresh HUD: {ex.Message}");
+            }
+        }
+
+        private static void AddPerkToTree(PerkTree tree, Perk perk)
+        {
+            var fi = typeof(PerkTree).GetField("perks", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var list = fi?.GetValue(tree) as System.Collections.IList;
+            if (list == null)
+            {
+                var listType = typeof(System.Collections.Generic.List<>).MakeGenericType(typeof(Perk));
+                list = Activator.CreateInstance(listType) as System.Collections.IList;
+                fi?.SetValue(tree, list);
+            }
+            if (list != null && !list.Contains(perk)) list.Add(perk);
+        }
+
+        private static PerkRelationNode? AddGraphNode(object? graph, Perk perk)
+        {
+            if (graph == null) return null;
+            try
+            {
                 var methods = graph.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 MethodInfo? addNodeMethod = null;
 
                 foreach (var m in methods)
                 {
-                    if (m.Name != "AddNode") continue;
-                    if (!m.IsGenericMethodDefinition) continue;
+                    if (m.Name != "AddNode" || !m.IsGenericMethodDefinition) continue;
                     
                     var typeArgs = m.GetGenericArguments();
                     if (typeArgs.Length != 1) continue;
 
                     var parameters = m.GetParameters();
-                    if (parameters.Length == 0)
-                    {
-                        // AddNode<T>()
-                        addNodeMethod = m;
-                        // break; // 移除以允许回退到 AddNode<T>(Vector2)（如果可用）
-                    }
-                    if (parameters.Length == 1 && parameters[0].ParameterType == typeof(Vector2))
-                    {
-                        // AddNode<T>(Vector2) - 优先使用带坐标的版本，设为0
-                        addNodeMethod = m;
-                        // 不break，继续看有没有无参的，或者就用这个
-                    }
+                    if (parameters.Length == 0) addNodeMethod = m;
+                    if (parameters.Length == 1 && parameters[0].ParameterType == typeof(Vector2)) addNodeMethod = m;
                 }
 
                 if (addNodeMethod != null)
                 {
                     var gen = addNodeMethod.MakeGenericMethod(typeof(PerkRelationNode));
                     var ps = gen.GetParameters();
-                    object? node = null;
-                    if (ps.Length == 0)
-                    {
-                         node = gen.Invoke(graph, Array.Empty<object>());
-                    }
-                    else
-                    {
-                         node = gen.Invoke(graph, new object[] { Vector2.zero });
-                    }
+                    object? node = ps.Length == 0 ? gen.Invoke(graph, Array.Empty<object>()) : gen.Invoke(graph, new object[] { Vector2.zero });
 
                     if (node is PerkRelationNode prn)
                     {
                         prn.relatedNode = perk;
                         return prn;
                     }
-                }
-                else
-                {
-                    Debug.LogError("[SuperStorageMod] Failed to find Graph.AddNode generic method.");
                 }
             }
             catch (Exception ex)
@@ -383,209 +438,51 @@ namespace SuperStorageMod
             return null;
         }
 
-        /// <summary>
-        /// 设置对象的私有字段值
-        /// </summary>
-        /// <param name="target">目标对象</param>
-        /// <param name="field">字段名</param>
-        /// <param name="value">字段值</param>
-        private static void SetPrivate(object target, string field, object value)
+        private static void SetPrivate(object target, string field, object? value)
         {
-            var fi = target.GetType().GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var type = target.GetType();
+            FieldInfo? fi = null;
+            while (type != null && fi == null)
+            {
+                fi = type.GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                type = type.BaseType;
+            }
             fi?.SetValue(target, value);
         }
 
-        /// <summary>
-        /// 获取对象的私有字段值
-        /// </summary>
-        /// <typeparam name="T">字段类型</typeparam>
-        /// <param name="target">目标对象</param>
-        /// <param name="field">字段名</param>
-        /// <returns>字段值</returns>
         [return: MaybeNull]
         private static T GetPrivate<T>(object target, string field)
         {
-            var fi = target.GetType().GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var type = target.GetType();
+            FieldInfo? fi = null;
+            while (type != null && fi == null)
+            {
+                fi = type.GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                type = type.BaseType;
+            }
             return fi != null ? (T)fi.GetValue(target) : default;
         }
 
-        /// <summary>
-        /// 获取对象的私有长整型字段值
-        /// </summary>
-        /// <param name="target">目标对象</param>
-        /// <param name="field">字段名</param>
-        /// <returns>字段值</returns>
         private static long GetPrivateLong(object target, string field)
         {
-            var fi = target.GetType().GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var type = target.GetType();
+            FieldInfo? fi = null;
+            while (type != null && fi == null)
+            {
+                fi = type.GetField(field, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                type = type.BaseType;
+            }
             if (fi == null) return 0L;
             var v = fi.GetValue(target);
-            if (v is long l) return l;
-            return 0L;
+            return v is long l ? l : 0L;
         }
 
-        /// <summary>
-        /// 测量技能树列的属性，包括极值Y坐标、步长和方向符号
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <param name="baseNode">基础节点</param>
-        /// <param name="toleranceX">X轴容差</param>
-        /// <returns>包含极值Y、步长和方向符号的元组</returns>
-        private static (float extremeY, float step, float downSign) MeasureColumn(PerkTree tree, PerkRelationNode baseNode, float toleranceX = TOLERANCE_X)
-        {
-            if (tree == null || baseNode == null)
-            {
-                return (0f, DEFAULT_NODE_SPACING, -1f);
-            }
-
-            var graph = tree.RelationGraphOwner?.RelationGraph;
-            if (graph == null)
-            {
-                return (baseNode.cachedPosition.y, DEFAULT_NODE_SPACING, -1f);
-            }
-
-            float baseX = baseNode.cachedPosition.x;
-            float minY = baseNode.cachedPosition.y;
-            float maxY = baseNode.cachedPosition.y;
-            System.Collections.Generic.List<float> deltas = new System.Collections.Generic.List<float>();
-            var q = new System.Collections.Generic.Queue<PerkRelationNode>();
-            var visited = new System.Collections.Generic.HashSet<PerkRelationNode>();
-            q.Enqueue(baseNode);
-            visited.Add(baseNode);
-            
-            while (q.Count > 0)
-            {
-                var n = q.Dequeue();
-                foreach (var child in graph.GetOutgoingNodes(n))
-                {
-                    if (child == null || !visited.Add(child)) continue;
-                    if (Mathf.Abs(child.cachedPosition.x - baseX) < toleranceX)
-                    {
-                        minY = Mathf.Min(minY, child.cachedPosition.y);
-                        maxY = Mathf.Max(maxY, child.cachedPosition.y);
-                        var d = child.cachedPosition.y - n.cachedPosition.y;
-                        if (Mathf.Abs(d) > MIN_DELTA_THRESHOLD) deltas.Add(d);
-                    }
-                    q.Enqueue(child);
-                }
-            }
-            
-            float avgDelta = deltas.Count > 0 ? deltas.Average() : -4.0f;
-            float downSign = avgDelta < 0 ? -1f : 1f;
-            float step = deltas.Count > 0 ? deltas.Select(Mathf.Abs).Max() : Mathf.Abs(avgDelta);
-            float extremeY = downSign < 0 ? minY : maxY;
-            return (extremeY, step, downSign);
-        }
-
-        /// <summary>
-        /// 根据显示名称查找技能节点
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <param name="contains">包含的字符串</param>
-        /// <returns>找到的技能节点，找不到返回null</returns>
-        private static Perk? FindPerkByName(PerkTree tree, string contains)
-        {
-            if (tree == null || string.IsNullOrEmpty(contains)) return null;
-            return tree.Perks.FirstOrDefault(p => p != null && (p.DisplayName ?? string.Empty).Contains(contains));
-        }
-
-        /// <summary>
-        /// 根据原始名称查找技能节点
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <param name="raw">原始名称</param>
-        /// <returns>找到的技能节点，找不到返回null</returns>
-        private static Perk? FindPerkByRawName(PerkTree tree, string raw)
-        {
-            if (tree == null || string.IsNullOrEmpty(raw)) return null;
-            return tree.Perks.FirstOrDefault(p => p != null && p.DisplayNameRaw == raw);
-        }
-
-        /// <summary>
-        /// 计算节点的水平间距
-        /// </summary>
-        /// <param name="anchor">锚点节点</param>
-        /// <param name="tree">技能树对象</param>
-        /// <returns>水平间距</returns>
-        private static float ComputeDx(PerkRelationNode anchor, PerkTree tree)
-        {
-            if (anchor == null || tree == null) return DEFAULT_NODE_SPACING;
-
-            var graph = tree.RelationGraphOwner?.RelationGraph;
-            if (graph == null) return DEFAULT_NODE_SPACING;
-
-            var nodes = graph.GetIncomingNodes(anchor).Concat(graph.GetOutgoingNodes(anchor)).ToList();
-            float baseX = anchor.cachedPosition.x;
-            var diffs = nodes.Where(n => n != null).Select(n => Mathf.Abs(n.cachedPosition.x - baseX)).Where(d => d > MIN_DELTA_THRESHOLD).ToList();
-            float dx = diffs.Count > 0 ? diffs.Average() : DEFAULT_NODE_SPACING;
-            return Mathf.Max(dx, MIN_NODE_SPACING);
-        }
-
-        /// <summary>
-        /// 计算节点的向上垂直间距
-        /// </summary>
-        /// <param name="anchor">锚点节点</param>
-        /// <param name="tree">技能树对象</param>
-        /// <returns>垂直间距</returns>
-        private static float ComputeDyUp(PerkRelationNode anchor, PerkTree tree)
-        {
-            if (anchor == null || tree == null) return DEFAULT_NODE_SPACING;
-
-            var graph = tree.RelationGraphOwner?.RelationGraph;
-            if (graph == null) return DEFAULT_NODE_SPACING;
-
-            var nodes = graph.GetIncomingNodes(anchor).ToList();
-            float baseY = anchor.cachedPosition.y;
-            var diffs = nodes.Where(n => n != null).Select(n => n.cachedPosition.y - baseY).ToList();
-            if (diffs.Count == 0) return DEFAULT_NODE_SPACING;
-            float avg = diffs.Average();
-            float sign = avg < 0 ? -1f : 1f; 
-            float mag = diffs.Select(d => Mathf.Abs(d)).Max();
-            mag = Mathf.Max(mag, DEFAULT_NODE_SPACING);
-            return sign * mag;
-        }
-
-        /// <summary>
-        /// 将缓存物品转移到仓库
-        /// </summary>
-        private static async UniTask DrainBufferToStorage()
-        {
-            var buf = PlayerStorage.IncomingItemBuffer;
-            if (buf == null) return;
-            int guard = BUFFER_GUARD_COUNT;
-            while (buf.Count > 0 && guard-- > 0)
-            {
-                int idx = buf.Count - 1;
-                // 防止越界
-                if (idx < 0 || idx >= buf.Count) break;
-
-                int countBefore = buf.Count;
-                try
-                {
-                    await PlayerStorage.TakeBufferItem(idx);
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[SuperStorageMod] Failed to take buffer item at {idx}: {ex}");
-                }
-                if (buf.Count == countBefore) break;
-            }
-        }
-
-        /// <summary>
-        /// 模组解锁状态监视组件
-        /// </summary>
         private class ModUnlockWatcher : MonoBehaviour
         {
             private PerkTree? tree;
             private Perk? perk;
             private bool last;
             
-            /// <summary>
-            /// 初始化监视组件
-            /// </summary>
-            /// <param name="t">技能树对象</param>
-            /// <param name="p">技能节点</param>
             public void Init(PerkTree t, Perk p)
             {
                 tree = t;
@@ -593,9 +490,6 @@ namespace SuperStorageMod
                 last = perk != null && perk.Unlocked;
             }
             
-            /// <summary>
-            /// 每帧更新，检查解锁状态变化
-            /// </summary>
             private void Update()
             {
                 var cur = perk != null && perk.Unlocked;
@@ -611,37 +505,6 @@ namespace SuperStorageMod
             }
         }
 
-        /// <summary>
-        /// 获取技能树ID
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
-        /// <returns>技能树ID</returns>
-        private static string GetTreeID(PerkTree tree)
-        {
-            if (tree == null) return UNKNOWN_TREE_ID;
-            
-            var tp = typeof(PerkTree);
-            var pi = tp.GetProperty("ID", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (pi != null)
-            {
-                var v = pi.GetValue(tree) as string;
-                if (!string.IsNullOrEmpty(v)) return v;
-            }
-            var fi = tp.GetField("perkTreeID", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-            if (fi != null)
-            {
-                var v = fi.GetValue(tree) as string;
-                if (!string.IsNullOrEmpty(v)) return v;
-            }
-            var name = tree.name;
-            return string.IsNullOrEmpty(name) ? UNKNOWN_TREE_ID : name;
-        }
-
-        /// <summary>
-        /// 通过简单名称查找类型
-        /// </summary>
-        /// <param name="name">类型名称</param>
-        /// <returns>类型对象</returns>
         private static Type? FindTypeBySimpleName(string name)
         {
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -656,10 +519,6 @@ namespace SuperStorageMod
             return null;
         }
 
-        /// <summary>
-        /// 获取当前存档槽位
-        /// </summary>
-        /// <returns>存档槽位编号</returns>
         private static int GetCurrentSlot()
         {
             var t = FindTypeBySimpleName("SavesSystem");
@@ -672,10 +531,6 @@ namespace SuperStorageMod
             return 1;
         }
 
-        /// <summary>
-        /// 获取备份目录路径
-        /// </summary>
-        /// <returns>备份目录路径</returns>
         private static string GetBackupDir()
         {
             var dir = Path.Combine(Application.persistentDataPath, BACKUP_DIR_NAME);
@@ -683,24 +538,15 @@ namespace SuperStorageMod
             return dir;
         }
 
-        /// <summary>
-        /// 获取备份文件路径
-        /// </summary>
-        /// <returns>备份文件路径</returns>
         private static string GetBackupPath()
         {
             int slot = GetCurrentSlot();
             return Path.Combine(GetBackupDir(), $"{BACKUP_FILE_PREFIX}{slot}.txt");
         }
 
-        /// <summary>
-        /// 保存解锁状态备份到磁盘
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
         private static void SaveUnlockedBackupToDisk(PerkTree tree)
         {
             if (tree == null) return;
-            
             try
             {
                 var ids = tree.Perks.Where(p => p != null && (p.DisplayNameRaw ?? string.Empty).StartsWith(PERK_NAME_PREFIX) && p.Unlocked)
@@ -710,14 +556,9 @@ namespace SuperStorageMod
             catch { }
         }
 
-        /// <summary>
-        /// 从磁盘恢复解锁状态
-        /// </summary>
-        /// <param name="tree">技能树对象</param>
         private static void RestoreUnlockedFromDisk(PerkTree tree)
         {
             if (tree == null) return;
-            
             var path = GetBackupPath();
             if (!File.Exists(path)) return;
             string[]? lines = null;
@@ -737,7 +578,6 @@ namespace SuperStorageMod
             foreach (var p in tree.Perks)
             {
                 if (p == null || p.gameObject == null || !set.Contains(p.gameObject.name)) continue;
-                
                 try
                 {
                     if (!p.Unlocked)
@@ -751,6 +591,9 @@ namespace SuperStorageMod
                     Debug.LogError($"[SuperStorageMod] Failed to restore perk {p.gameObject?.name ?? "Unknown"}: {ex}");
                 }
             }
+            
+            // 确保恢复后触发仓库容量刷新
+            PlayerStorage.NotifyCapacityDirty();
         }
     }
 }
