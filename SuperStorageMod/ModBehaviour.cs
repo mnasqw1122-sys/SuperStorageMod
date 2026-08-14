@@ -9,6 +9,7 @@ using Duckov.Modding;
 using Duckov.PerkTrees;
 using Duckov.PerkTrees.Interactable;
 using NodeCanvas.Framework;
+using Saves;
 using SodaCraft.Localizations;
 using UnityEngine;
 using Object = UnityEngine.Object;
@@ -26,6 +27,7 @@ namespace SuperStorageMod
         private const string BACKUP_FILE_PREFIX = "backup_slot_";
         private const string BACKUP_FILE_EXT = ".json";
         private const string CUSTOM_TREE_ID = "SuperStorageExpand";
+        private const string OFFICIAL_TREE_ID = "StorageExpand";
         private const string CUSTOM_INTERACT_KEY = "SuperStorage_InteractName";
         private const int MOD_DATA_VERSION = 1;
 
@@ -66,10 +68,24 @@ namespace SuperStorageMod
             {
                 if (_myCachedTree == null)
                 {
-                    _myCachedTree = PerkTreeManager.GetPerkTree(CUSTOM_TREE_ID);
+                    _myCachedTree = FindCustomTreeQuietly();
                 }
                 return _myCachedTree;
             }
+        }
+
+        // 与 PerkTreeManager.GetPerkTree 相同的查找逻辑，但不会在找不到时打印 Error 日志。
+        // 模组在注入完成前查询自定义树属于正常流程（此时树尚未创建），不应触发游戏内部的 LogError 噪音。
+        private static PerkTree? FindCustomTreeQuietly()
+        {
+            var mgr = PerkTreeManager.Instance;
+            if (mgr == null || mgr.perkTrees == null) return null;
+
+            foreach (var tree in mgr.perkTrees)
+            {
+                if (tree != null && tree.ID == CUSTOM_TREE_ID) return tree;
+            }
+            return null;
         }
 
         private void Awake()
@@ -99,6 +115,7 @@ namespace SuperStorageMod
         {
             SubscribeLevelInitialized(OnLevelInitialized);
             EnsureSafetyNetSubscribed();
+            SavesSystem.OnSetFile += OnSetFileChanged;
             Debug.Log("[SuperStorageMod] OnEnable: Subscribed to OnLevelInitialized and OnRecalculateStorageCapacity.");
         }
 
@@ -106,6 +123,7 @@ namespace SuperStorageMod
         {
             UnsubscribeLevelInitialized(OnLevelInitialized);
             EnsureSafetyNetUnsubscribed();
+            SavesSystem.OnSetFile -= OnSetFileChanged;
 
             var tree = MyTree;
             if (tree != null)
@@ -116,6 +134,14 @@ namespace SuperStorageMod
             _myCachedTree = null;
             _cachedBackupCapacity = -1;
             _cachedSlot = null;
+        }
+
+        // 切换存档槽位时，槽位缓存与备份容量缓存必须失效，否则会读写旧槽位的备份文件。
+        private static void OnSetFileChanged()
+        {
+            _cachedSlot = null;
+            _cachedBackupCapacity = -1;
+            _backupFileLastWrite = default;
         }
 
         private void OnDestroy()
@@ -137,7 +163,7 @@ namespace SuperStorageMod
                 var fi = GetCachedField(typeof(LevelManager), "OnLevelInitialized");
                 if (fi == null)
                 {
-                    Debug.LogWarning("[SuperStorageMod] Could not find LevelManager.OnLevelInitialized field. Falling back to polling.");
+                    Debug.LogWarning("[SuperStorageMod] Could not find LevelManager.OnLevelInitialized field. Mod will not auto-inject on level load.");
                     return;
                 }
 
@@ -191,23 +217,42 @@ namespace SuperStorageMod
 
         private void OnRecalculateStorageCapacity(PlayerStorage.StorageCapacityCalculationHolder holder)
         {
-            RegisterPerkTreeToLevelConfig();
+            try
+            {
+                RegisterPerkTreeToLevelConfig();
 
-            bool addActive = IsAddPlayerStorageActive();
-            int backupCapacity = CalculateCapacityFromBackup();
+                bool addActive = IsAddPlayerStorageActive();
+                int backupCapacity = CalculateCapacityFromBackup();
+                ApplyCapacitySafetyNet(holder, addActive, backupCapacity);
+            }
+            catch (Exception ex)
+            {
+                // 容量重算事件链中不能抛异常，否则会中断游戏后续订阅者的计算。
+                Debug.LogError($"[SuperStorageMod] Error in OnRecalculateStorageCapacity: {ex}");
 
+                // 兜底：无论发生什么，保证容量不低于 默认容量 + 备份容量。
+                try
+                {
+                    ApplyCapacitySafetyNet(holder, false, CalculateCapacityFromBackup());
+                }
+                catch (Exception innerEx)
+                {
+                    Debug.LogError($"[SuperStorageMod] SafetyNet fallback failed: {innerEx.Message}");
+                }
+            }
+        }
+
+        private void ApplyCapacitySafetyNet(PlayerStorage.StorageCapacityCalculationHolder holder, bool addActive, int backupCapacity)
+        {
             if (addActive)
             {
                 Debug.Log($"[SuperStorageMod] AddPlayerStorage appears active (backup says {backupCapacity} capacity).");
             }
 
-            if (!addActive)
+            if (!addActive && backupCapacity > 0)
             {
-                if (backupCapacity > 0)
-                {
-                    holder.capacity += backupCapacity;
-                    Debug.Log($"[SuperStorageMod] SafetyNet: added {backupCapacity} capacity from backup (AddPlayerStorage inactive).");
-                }
+                holder.capacity += backupCapacity;
+                Debug.Log($"[SuperStorageMod] SafetyNet: added {backupCapacity} capacity from backup (AddPlayerStorage inactive).");
             }
 
             if (PlayerStorage.Inventory != null)
@@ -237,16 +282,16 @@ namespace SuperStorageMod
             }
         }
 
+        // 与游戏 AddPlayerStorage.OnRecalculatePlayerStorage 的判断完全一致：
+        // 只检查 Perk.Unlocked，不检查 EnabledInCurrentLevel（官方不检查，检查会导致安全网与官方路径叠加、容量双倍）。
         private bool IsAddPlayerStorageActive()
         {
             var myTree = MyTree;
             if (myTree == null) return false;
-            if (!myTree.EnabledInCurrentLevel) return false;
 
             foreach (var perk in myTree.Perks)
             {
                 if (perk == null || !perk.Unlocked) continue;
-                if (!perk.EnabledInCurrentLevel) continue;
                 var add = perk.GetComponent<AddPlayerStorage>();
                 if (add != null) return true;
             }
@@ -267,6 +312,14 @@ namespace SuperStorageMod
                 }
 
                 var lines = File.ReadAllLines(path);
+
+                // 版本不兼容的旧备份（未来升级导致格式变化时）直接忽略，避免误恢复。
+                if (!IsBackupVersionCompatible(lines))
+                {
+                    Debug.LogWarning($"[SuperStorageMod] Backup file version is not compatible (require <= v{MOD_DATA_VERSION}), ignoring: {path}");
+                    return 0;
+                }
+
                 var set = new HashSet<string>(lines.Where(s => !string.IsNullOrEmpty(s) && !s.StartsWith("#")));
 
                 int total = 0;
@@ -295,6 +348,9 @@ namespace SuperStorageMod
 
             _injected = true;
 
+            // 记录本次注入开始前已创建的对象数量，失败时仅清理本次新建的对象，不影响历史对象。
+            int injectStartIndex = _createdObjects.Count;
+
             try
             {
                 Debug.Log("[SuperStorageMod] Injecting... Waiting for level load to settle.");
@@ -312,7 +368,7 @@ namespace SuperStorageMod
                     }
                 }
 
-                var officialTree = PerkTreeManager.GetPerkTree("StorageExpand");
+                var officialTree = PerkTreeManager.GetPerkTree(OFFICIAL_TREE_ID);
                 if (officialTree == null)
                 {
                     Debug.LogWarning("[SuperStorageMod] Official StorageExpand tree not found! Cannot copy base data.");
@@ -346,13 +402,30 @@ namespace SuperStorageMod
             {
                 _injected = false;
                 _myCachedTree = null;
+                CleanupCreatedObjectsFrom(injectStartIndex);
                 Debug.LogError($"[SuperStorageMod] Fatal error in Inject: {ex}");
+            }
+        }
+
+        // 清理 _createdObjects 中从 startIndex 起新建的对象（用于失败回滚）。
+        private void CleanupCreatedObjectsFrom(int startIndex)
+        {
+            for (int i = _createdObjects.Count - 1; i >= startIndex; i--)
+            {
+                var go = _createdObjects[i];
+                if (go != null)
+                {
+                    Object.Destroy(go);
+                }
+                _createdObjects.RemoveAt(i);
             }
         }
 
         private PerkTree? CreateCustomPerkTree(PerkTree officialTree)
         {
             Debug.Log("[SuperStorageMod] Creating custom PerkTree...");
+
+            int startIndex = _createdObjects.Count;
 
             var myTreeGo = new GameObject("PerkTree_" + CUSTOM_TREE_ID);
             myTreeGo.transform.SetParent(PerkTreeManager.Instance.transform);
@@ -365,6 +438,7 @@ namespace SuperStorageMod
             if (ownerType == null)
             {
                 Debug.LogError("[SuperStorageMod] PerkTreeRelationGraphOwner type not found!");
+                CleanupCreatedObjectsFrom(startIndex);
                 return null;
             }
 
@@ -374,6 +448,7 @@ namespace SuperStorageMod
             if (graphType == null)
             {
                 Debug.LogError("[SuperStorageMod] PerkRelationGraph type not found!");
+                CleanupCreatedObjectsFrom(startIndex);
                 return null;
             }
 
@@ -381,6 +456,7 @@ namespace SuperStorageMod
             if (graph == null)
             {
                 Debug.LogError("[SuperStorageMod] Failed to create PerkRelationGraph instance!");
+                CleanupCreatedObjectsFrom(startIndex);
                 return null;
             }
 
@@ -408,75 +484,90 @@ namespace SuperStorageMod
 
             for (int i = 0; i < Tiers.Length; i++)
             {
-                var tier = Tiers[i];
-                var perkGO = new GameObject($"SuperStorageMod_{tier.nameKey}");
-                perkGO.transform.SetParent(myTree.transform);
-                _createdObjects.Add(perkGO);
-
-                var perk = perkGO.AddComponent<Perk>();
-
-                SetFieldValue(perk, "master", myTree);
-                SetFieldValue(perk, "icon", icon);
-                SetFieldValue(perk, "quality", quality);
-                SetFieldValue(perk, "displayName", tier.nameKey);
-                SetFieldValue(perk, "hasDescription", true);
-                SetFieldValue(perk, "defaultUnlocked", false);
-
-                var reqType = FindTypeCached("PerkRequirement");
-                object? req = null;
-                if (reqType != null)
-                {
-                    req = Activator.CreateInstance(reqType);
-                    reqType.GetField("level")?.SetValue(req, tier.requireLevel);
-
-                    var costType = FindTypeCached("Cost");
-                    if (costType != null)
-                    {
-                        try
-                        {
-                            var itemsArr = tier.items.Select(e => new ValueTuple<int, long>(e.id, e.amount)).ToArray();
-                            object? cost = Activator.CreateInstance(costType, tier.money, itemsArr);
-                            reqType.GetField("cost")?.SetValue(req, cost);
-                        }
-                        catch (Exception costEx)
-                        {
-                            Debug.LogWarning($"[SuperStorageMod] Failed to create Cost for {tier.nameKey}: {costEx.Message}. Creating money-only cost.");
-                            try
-                            {
-                                object? cost = Activator.CreateInstance(costType, tier.money);
-                                reqType.GetField("cost")?.SetValue(req, cost);
-                            }
-                            catch { }
-                        }
-                    }
-
-                    reqType.GetField("requireTime")?.SetValue(req, requireTimeTicks);
-                }
-                else
-                {
-                    Debug.LogWarning("[SuperStorageMod] PerkRequirement type not found, perk will have no requirement.");
-                }
-
-                SetFieldValue(perk, "requirement", req);
-
-                var add = perkGO.AddComponent<AddPlayerStorage>();
-                SetFieldValue(add, "addCapacity", tier.addCap);
-
-                SubscribePerkUnlockEvent(perk);
-
-                AddPerkToTree(myTree, perk);
-
-                var node = AddGraphNode(graph, perk);
-                if (node != null)
-                {
-                    node.cachedPosition = new Vector2(0, i * 150f);
-                }
+                CreatePerkNode(myTree, graph, Tiers[i], i, icon, quality, requireTimeTicks);
             }
 
             RegisterPerkTree(myTree);
             myTree.Load();
 
             return myTree;
+        }
+
+        // 创建单个等级节点：Perk 组件 + PerkRequirement + AddPlayerStorage + 解锁事件订阅 + 图节点。
+        private void CreatePerkNode(
+            PerkTree tree,
+            Graph graph,
+            (string nameKey, string displayName, int addCap, int requireLevel, long money, (int id, int amount)[] items) tier,
+            int index,
+            Sprite? icon,
+            ItemStatsSystem.DisplayQuality quality,
+            long? requireTimeTicks)
+        {
+            var perkGO = new GameObject($"SuperStorageMod_{tier.nameKey}");
+            perkGO.transform.SetParent(tree.transform);
+            _createdObjects.Add(perkGO);
+
+            var perk = perkGO.AddComponent<Perk>();
+
+            SetFieldValue(perk, "master", tree);
+            SetFieldValue(perk, "icon", icon);
+            SetFieldValue(perk, "quality", quality);
+            SetFieldValue(perk, "displayName", tier.nameKey);
+            SetFieldValue(perk, "hasDescription", true);
+            SetFieldValue(perk, "defaultUnlocked", false);
+
+            var reqType = FindTypeCached("PerkRequirement");
+            object? req = null;
+            if (reqType != null)
+            {
+                req = Activator.CreateInstance(reqType);
+                reqType.GetField("level")?.SetValue(req, tier.requireLevel);
+
+                var costType = FindTypeCached("Cost");
+                if (costType != null)
+                {
+                    try
+                    {
+                        var itemsArr = tier.items.Select(e => new ValueTuple<int, long>(e.id, e.amount)).ToArray();
+                        object? cost = Activator.CreateInstance(costType, tier.money, itemsArr);
+                        reqType.GetField("cost")?.SetValue(req, cost);
+                    }
+                    catch (Exception costEx)
+                    {
+                        Debug.LogWarning($"[SuperStorageMod] Failed to create Cost for {tier.nameKey}: {costEx.Message}. Creating money-only cost.");
+                        try
+                        {
+                            object? cost = Activator.CreateInstance(costType, tier.money);
+                            reqType.GetField("cost")?.SetValue(req, cost);
+                        }
+                        catch (Exception moneyCostEx)
+                        {
+                            Debug.LogWarning($"[SuperStorageMod] Failed to create money-only Cost for {tier.nameKey}: {moneyCostEx.Message}");
+                        }
+                    }
+                }
+
+                reqType.GetField("requireTime")?.SetValue(req, requireTimeTicks);
+            }
+            else
+            {
+                Debug.LogWarning("[SuperStorageMod] PerkRequirement type not found, perk will have no requirement.");
+            }
+
+            SetFieldValue(perk, "requirement", req);
+
+            var add = perkGO.AddComponent<AddPlayerStorage>();
+            SetFieldValue(add, "addCapacity", tier.addCap);
+
+            SubscribePerkUnlockEvent(perk);
+
+            AddPerkToTree(tree, perk);
+
+            var node = AddGraphNode(graph, perk);
+            if (node != null)
+            {
+                node.cachedPosition = new Vector2(0, index * 150f);
+            }
         }
 
         private static void RegisterPerkTree(PerkTree tree)
@@ -522,6 +613,8 @@ namespace SuperStorageMod
             }
         }
 
+        private static FieldInfo? _enabledPerkTreesField;
+
         private static void RegisterPerkTreeToLevelConfig()
         {
             try
@@ -533,18 +626,21 @@ namespace SuperStorageMod
                     return;
                 }
 
-                var enabledField = typeof(LevelConfig).GetField("enabledPerkTrees", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                if (enabledField == null)
+                if (_enabledPerkTreesField == null)
                 {
-                    Debug.LogWarning("[SuperStorageMod] Could not find enabledPerkTrees field on LevelConfig.");
-                    return;
+                    _enabledPerkTreesField = typeof(LevelConfig).GetField("enabledPerkTrees", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (_enabledPerkTreesField == null)
+                    {
+                        Debug.LogWarning("[SuperStorageMod] Could not find enabledPerkTrees field on LevelConfig.");
+                        return;
+                    }
                 }
 
-                var idList = enabledField.GetValue(levelConfig) as PerkTreeIDList;
+                var idList = _enabledPerkTreesField.GetValue(levelConfig) as PerkTreeIDList;
                 if (idList == null)
                 {
                     idList = ScriptableObject.CreateInstance<PerkTreeIDList>();
-                    enabledField.SetValue(levelConfig, idList);
+                    _enabledPerkTreesField.SetValue(levelConfig, idList);
 
                     var defaultTrees = GetDefaultEnabledPerkTrees();
                     if (defaultTrees != null)
@@ -596,7 +692,10 @@ namespace SuperStorageMod
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod] Failed to read default enabled perk trees: {ex.Message}");
+            }
             return null;
         }
 
@@ -608,7 +707,7 @@ namespace SuperStorageMod
 
             var officialInvokers = allBase
                 .OfType<PerkTreeUIInvoker>()
-                .Where(inv => inv.perkTreeID == "StorageExpand" && inv.gameObject.scene.IsValid())
+                .Where(inv => inv.perkTreeID == OFFICIAL_TREE_ID && inv.gameObject.scene.IsValid())
                 .ToList();
 
             if (officialInvokers.Count == 0)
@@ -921,6 +1020,19 @@ namespace SuperStorageMod
 
         #region 存档备份与恢复
 
+        // 校验备份文件版本兼容性：无版本头视为 v0（兼容）；有 #version:N 头要求 N <= MOD_DATA_VERSION。
+        private static bool IsBackupVersionCompatible(string[] lines)
+        {
+            foreach (var line in lines)
+            {
+                if (string.IsNullOrEmpty(line)) continue;
+                if (!line.StartsWith("#version:", StringComparison.Ordinal)) continue;
+
+                return int.TryParse(line.Substring("#version:".Length).Trim(), out var version) && version <= MOD_DATA_VERSION;
+            }
+            return true;
+        }
+
         private static void EnsureBackupDirExists()
         {
             if (_backupDirCreated) return;
@@ -946,7 +1058,10 @@ namespace SuperStorageMod
                     if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
                     _backupDirCreated = true;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[SuperStorageMod] Failed to ensure backup directory: {ex.Message}");
+                }
             }
             return dir;
         }
@@ -957,16 +1072,11 @@ namespace SuperStorageMod
 
             try
             {
-                var t = FindTypeCached("SavesSystem");
-                var pi = t?.GetProperty("CurrentSlot", BindingFlags.Public | BindingFlags.Static);
-                if (pi != null)
+                int slot = SavesSystem.CurrentSlot;
+                if (slot > 0)
                 {
-                    var v = pi.GetValue(null, null);
-                    if (v is int i && i > 0)
-                    {
-                        _cachedSlot = i;
-                        return i;
-                    }
+                    _cachedSlot = slot;
+                    return slot;
                 }
             }
             catch (Exception ex)
@@ -1028,6 +1138,13 @@ namespace SuperStorageMod
             }
 
             if (lines == null || lines.Length == 0) return;
+
+            // 版本不兼容的旧备份直接忽略，避免误恢复。
+            if (!IsBackupVersionCompatible(lines))
+            {
+                Debug.LogWarning($"[SuperStorageMod] Backup file version is not compatible (require <= v{MOD_DATA_VERSION}), ignoring: {path}");
+                return;
+            }
 
             var set = new HashSet<string>(lines.Where(s => !string.IsNullOrEmpty(s) && !s.StartsWith("#")));
 
