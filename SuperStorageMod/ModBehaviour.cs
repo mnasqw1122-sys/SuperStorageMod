@@ -8,6 +8,7 @@ using Duckov.Economy;
 using Duckov.Modding;
 using Duckov.PerkTrees;
 using Duckov.PerkTrees.Interactable;
+using ItemStatsSystem;
 using NodeCanvas.Framework;
 using Saves;
 using SodaCraft.Localizations;
@@ -18,11 +19,54 @@ namespace SuperStorageMod
 {
     public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
-        private const int SMALL_BOX_ID = 50;
-        private const int MED_BOX_ID = 49;
-        private const int BIG_BOX_ID = 48;
-        private const float INJECT_DELAY_SECONDS = 1.5f;
+        // 扩容箱的“内部名 → 兜底 ID”。运行期优先用 ItemAssetsCollection.TryGetIDByName 反查，
+        // 只有反查失败时才退回硬编码 ID（原实现完全依赖硬编码，游戏更新导致 ID 漂移即失效）。
+        //
+        // ⚠️ 内部名与本地化键不同：entries 里 metaData.Name = "ContinerS/M/L"，
+        //    而 metaData.DisplayNameKey = "Item_ContinerS/M/L"（本地化 CSV 的键）。
+        //    TryGetIDByName 比对的是 Name，所以必须用 "ContinerS" 这类短名。
+        //    实机日志证据（Player.log）：typeID=50 name='ContinerS' displayKey='Item_ContinerS'。
+        private static readonly (string internalName, int fallbackId)[] BoxDefinitions = new[]
+        {
+            ("ContinerS", 50),
+            ("ContinerM", 49),
+            ("ContinerL", 48)
+        };
+
+        // 每个等级需求的箱子数量，顺序与 BoxDefinitions 一致（小 / 中 / 大）。
+        private static readonly int[][] TierBoxAmounts = new[]
+        {
+            new[] {  9,  6,  3 },
+            new[] { 12,  8,  4 },
+            new[] { 15, 10,  5 },
+            new[] { 18, 12,  6 },
+            new[] { 21, 14,  7 },
+            new[] { 24, 16,  8 },
+            new[] { 27, 18,  9 },
+            new[] { 30, 20, 10 },
+            new[] { 33, 22, 11 }
+        };
+
+        private static readonly (string nameKey, string displayName, int addCap, int requireLevel, long money)[] Tiers = new[]
+        {
+            ("SuperStorage_Lv2",  "超级仓库Lv.2",  150, 30, 600_000L),
+            ("SuperStorage_Lv3",  "超级仓库Lv.3",  200, 30, 700_000L),
+            ("SuperStorage_Lv4",  "超级仓库Lv.4",  250, 30, 800_000L),
+            ("SuperStorage_Lv5",  "超级仓库Lv.5",  300, 30, 900_000L),
+            ("SuperStorage_Lv6",  "超级仓库Lv.6",  350, 30, 1_000_000L),
+            ("SuperStorage_Lv7",  "超级仓库Lv.7",  450, 30, 1_200_000L),
+            ("SuperStorage_Lv8",  "超级仓库Lv.8",  500, 30, 1_400_000L),
+            ("SuperStorage_Lv9",  "超级仓库Lv.9",  550, 35, 1_600_000L),
+            ("SuperStorage_Lv10", "超级仓库Lv.10", 600, 40, 2_000_000L)
+        };
+
+        // 运行期解析出的箱子 ID（未解析前为 null）。
+        private static int[]? _boxIds;
+        private static bool _boxIdsResolved;
+        private static bool _snapshotLogged;
+
         private const string PERK_NAME_PREFIX = "SuperStorage_";
+        private const float INJECT_DELAY_SECONDS = 1.5f;
         private const string BACKUP_DIR_NAME = "SuperStorageMod";
         private const string BACKUP_FILE_PREFIX = "backup_slot_";
         private const string BACKUP_FILE_EXT = ".json";
@@ -30,19 +74,6 @@ namespace SuperStorageMod
         private const string OFFICIAL_TREE_ID = "StorageExpand";
         private const string CUSTOM_INTERACT_KEY = "SuperStorage_InteractName";
         private const int MOD_DATA_VERSION = 1;
-
-        private static readonly (string nameKey, string displayName, int addCap, int requireLevel, long money, (int id, int amount)[] items)[] Tiers = new[]
-        {
-            ("SuperStorage_Lv2",  "超级仓库Lv.2",  150, 30, 600_000L,   new[]{ (SMALL_BOX_ID,9),  (MED_BOX_ID,6),  (BIG_BOX_ID,3) }),
-            ("SuperStorage_Lv3",  "超级仓库Lv.3",  200, 30, 700_000L,   new[]{ (SMALL_BOX_ID,12), (MED_BOX_ID,8),  (BIG_BOX_ID,4) }),
-            ("SuperStorage_Lv4",  "超级仓库Lv.4",  250, 30, 800_000L,   new[]{ (SMALL_BOX_ID,15), (MED_BOX_ID,10), (BIG_BOX_ID,5) }),
-            ("SuperStorage_Lv5",  "超级仓库Lv.5",  300, 30, 900_000L,   new[]{ (SMALL_BOX_ID,18), (MED_BOX_ID,12), (BIG_BOX_ID,6) }),
-            ("SuperStorage_Lv6",  "超级仓库Lv.6",  350, 30, 1_000_000L, new[]{ (SMALL_BOX_ID,21), (MED_BOX_ID,14), (BIG_BOX_ID,7) }),
-            ("SuperStorage_Lv7",  "超级仓库Lv.7",  450, 30, 1_200_000L, new[]{ (SMALL_BOX_ID,24), (MED_BOX_ID,16), (BIG_BOX_ID,8) }),
-            ("SuperStorage_Lv8",  "超级仓库Lv.8",  500, 30, 1_400_000L, new[]{ (SMALL_BOX_ID,27), (MED_BOX_ID,18), (BIG_BOX_ID,9) }),
-            ("SuperStorage_Lv9",  "超级仓库Lv.9",  550, 35, 1_600_000L, new[]{ (SMALL_BOX_ID,30), (MED_BOX_ID,20), (BIG_BOX_ID,10) }),
-            ("SuperStorage_Lv10", "超级仓库Lv.10", 600, 40, 2_000_000L, new[]{ (SMALL_BOX_ID,33), (MED_BOX_ID,22), (BIG_BOX_ID,11) })
-        };
 
         private static readonly Dictionary<string, Type?> TypeCache = new Dictionary<string, Type?>();
         private static readonly Dictionary<(Type, string), FieldInfo?> FieldCache = new Dictionary<(Type, string), FieldInfo?>();
@@ -376,6 +407,9 @@ namespace SuperStorageMod
                     return;
                 }
 
+                // 解析扩容箱 ID（替代硬编码），必须在创建节点前完成。
+                ResolveBoxIds();
+
                 PerkTree? myTree = MyTree;
                 if (myTree == null)
                 {
@@ -386,6 +420,11 @@ namespace SuperStorageMod
                         return;
                     }
                     _myCachedTree = myTree;
+                }
+                else
+                {
+                    // 已存在的树（场景切换后复用）：检查图节点是否丢失并修复。
+                    EnsureGraphNodes(myTree);
                 }
 
                 RegisterPerkTreeToLevelConfig();
@@ -460,18 +499,7 @@ namespace SuperStorageMod
                 return null;
             }
 
-            var propGraph = ownerType.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                         ?? ownerType.BaseType?.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (propGraph != null)
-            {
-                propGraph.SetValue(owner, graph);
-            }
-            else
-            {
-                var graphField = ownerType.GetField("_relationGraph", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-                              ?? ownerType.BaseType?.GetField("_relationGraph", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                graphField?.SetValue(owner, graph);
-            }
+            SetGraphOnOwner(owner, ownerType, graph);
 
             SetFieldValue(myTree, "relationGraphOwner", owner);
 
@@ -493,17 +521,84 @@ namespace SuperStorageMod
             return myTree;
         }
 
+        // 把图实例挂到 PerkTreeRelationGraphOwner 上。
+        // 主路径：GraphOwner<T>.graph（public sealed override 属性，GraphOwner.cs:559-569）。
+        // 兜底路径：GraphOwner<T> 的私有字段 _graph（注意不是 PerkTreeRelationGraphOwner._relationGraph，
+        // 后者只是 RelationGraph 属性的缓存，写它不会让 GraphOwner 真正持有图）。
+        private static bool SetGraphOnOwner(Component owner, Type ownerType, Graph graph)
+        {
+            var propGraph = ownerType.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                         ?? ownerType.BaseType?.GetProperty("graph", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (propGraph != null && propGraph.CanWrite)
+            {
+                propGraph.SetValue(owner, graph);
+                return true;
+            }
+
+            var graphField = ownerType.GetField("_graph", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+                          ?? ownerType.BaseType?.GetField("_graph", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (graphField != null)
+            {
+                graphField.SetValue(owner, graph);
+                return true;
+            }
+
+            Debug.LogError("[SuperStorageMod] 无法把 PerkRelationGraph 挂到 owner 上：既找不到 graph 属性也找不到 _graph 字段。");
+            return false;
+        }
+
+        // 修复场景切换 / GameObject 重新激活后可能出现的“图节点丢失”：
+        // NodeCanvas 的 GraphOwner.OnEnable → StartBehaviour → Graph.Clone 用 Object.Instantiate 克隆图，
+        // 而 GraphSource._nodes 只有 [fsSerializeAs] 没有 [SerializeField]，
+        // 因此克隆出来的图是空的（PerkTreeView 会过滤掉所有节点，Perk.GetLayoutPosition 还会 NRE）。
+        // 这里检测每个 Perk 是否还有对应图节点，缺失就补建。
+        private void EnsureGraphNodes(PerkTree tree)
+        {
+            if (tree == null) return;
+
+            var owner = tree.RelationGraphOwner;
+            var graph = owner?.RelationGraph;
+            if (owner == null || graph == null)
+            {
+                Debug.LogWarning("[SuperStorageMod] EnsureGraphNodes: RelationGraphOwner 或 graph 为空，跳过。");
+                return;
+            }
+
+            int missing = 0;
+            for (int i = 0; i < Tiers.Length; i++)
+            {
+                Perk? perk = i < tree.Perks.Count ? tree.Perks[i] : null;
+                if (perk == null) continue;
+                if (graph.GetRelatedNode(perk) != null) continue;
+
+                var node = AddGraphNode(graph, perk);
+                if (node != null)
+                {
+                    node.cachedPosition = new Vector2(0, i * 150f);
+                    missing++;
+                }
+            }
+
+            if (missing > 0)
+            {
+                Debug.LogWarning($"[SuperStorageMod] 检测到 {missing} 个 Perk 缺少图节点（可能是图被克隆），已重建。");
+            }
+        }
+
         // 创建单个等级节点：Perk 组件 + PerkRequirement + AddPlayerStorage + 解锁事件订阅 + 图节点。
         private void CreatePerkNode(
             PerkTree tree,
             Graph graph,
-            (string nameKey, string displayName, int addCap, int requireLevel, long money, (int id, int amount)[] items) tier,
+            (string nameKey, string displayName, int addCap, int requireLevel, long money) tier,
             int index,
             Sprite? icon,
             ItemStatsSystem.DisplayQuality quality,
             long? requireTimeTicks)
         {
-            var perkGO = new GameObject($"SuperStorageMod_{tier.nameKey}");
+            // GameObject 名与 displayName 保持一致：
+            // PerkTree 的存档以 perk.name 为键（PerkTree.cs:28），备份文件以 DisplayNameRaw 为键，
+            // 两者同名后原生存档与模组备份就指向同一标识，避免双轨失配导致解锁记录清零。
+            var perkGO = new GameObject(tier.nameKey);
             perkGO.transform.SetParent(tree.transform);
             _createdObjects.Add(perkGO);
 
@@ -513,7 +608,9 @@ namespace SuperStorageMod
             SetFieldValue(perk, "icon", icon);
             SetFieldValue(perk, "quality", quality);
             SetFieldValue(perk, "displayName", tier.nameKey);
-            SetFieldValue(perk, "hasDescription", true);
+            // 不设描述：模组没有注册 "<key>_Desc" 本地化键，开启后会显示 "*SuperStorage_LvN_Desc*"。
+            // 容量说明由 AddPlayerStorage.Description 自动提供（PerkBehaviour_AddPlayerStorage）。
+            SetFieldValue(perk, "hasDescription", false);
             SetFieldValue(perk, "defaultUnlocked", false);
 
             var reqType = FindTypeCached("PerkRequirement");
@@ -526,15 +623,30 @@ namespace SuperStorageMod
                 var costType = FindTypeCached("Cost");
                 if (costType != null)
                 {
-                    try
+                    var tierItems = GetTierItems(index);
+                    bool costCreated = false;
+
+                    if (tierItems.Length > 0)
                     {
-                        var itemsArr = tier.items.Select(e => new ValueTuple<int, long>(e.id, e.amount)).ToArray();
-                        object? cost = Activator.CreateInstance(costType, tier.money, itemsArr);
-                        reqType.GetField("cost")?.SetValue(req, cost);
+                        try
+                        {
+                            var itemsArr = tierItems.Select(e => new ValueTuple<int, long>(e.id, e.amount)).ToArray();
+                            object? cost = Activator.CreateInstance(costType, tier.money, itemsArr);
+                            reqType.GetField("cost")?.SetValue(req, cost);
+                            costCreated = true;
+                        }
+                        catch (Exception costEx)
+                        {
+                            Debug.LogWarning($"[SuperStorageMod] Failed to create Cost for {tier.nameKey}: {costEx.Message}. Creating money-only cost.");
+                        }
                     }
-                    catch (Exception costEx)
+                    else
                     {
-                        Debug.LogWarning($"[SuperStorageMod] Failed to create Cost for {tier.nameKey}: {costEx.Message}. Creating money-only cost.");
+                        Debug.LogWarning($"[SuperStorageMod] {tier.nameKey}: 没有可用的扩容箱 ID，退化为纯金钱消耗。");
+                    }
+
+                    if (!costCreated)
+                    {
                         try
                         {
                             object? cost = Activator.CreateInstance(costType, tier.money);
@@ -639,18 +751,24 @@ namespace SuperStorageMod
                 var idList = _enabledPerkTreesField.GetValue(levelConfig) as PerkTreeIDList;
                 if (idList == null)
                 {
-                    idList = ScriptableObject.CreateInstance<PerkTreeIDList>();
-                    _enabledPerkTreesField.SetValue(levelConfig, idList);
-
+                    // 关卡的 enabledPerkTrees 为空时，游戏会回退到 GameplayDataSettings.DefaultEnabledPerkTrees
+                    // （LevelConfig.cs:197-208）。这里必须拿到官方默认列表再复制，
+                    // 否则新建的列表里只有自定义树 ID，会让本关卡所有官方技能树都判定为“未启用”。
                     var defaultTrees = GetDefaultEnabledPerkTrees();
-                    if (defaultTrees != null)
+                    if (defaultTrees == null || defaultTrees.perkTrees == null || defaultTrees.perkTrees.Count == 0)
                     {
-                        foreach (var id in defaultTrees.perkTrees)
-                        {
-                            if (!idList.perkTrees.Contains(id))
-                                idList.perkTrees.Add(id);
-                        }
+                        Debug.LogError("[SuperStorageMod] 无法读取官方默认技能树列表，跳过 enabledPerkTrees 注册（避免误关掉官方技能树）。将依赖 AddPlayerStorage 自身的 Unlocked 判定。");
+                        return;
                     }
+
+                    idList = ScriptableObject.CreateInstance<PerkTreeIDList>();
+                    foreach (var id in defaultTrees.perkTrees)
+                    {
+                        if (!idList.perkTrees.Contains(id))
+                            idList.perkTrees.Add(id);
+                    }
+                    _enabledPerkTreesField.SetValue(levelConfig, idList);
+                    Debug.Log($"[SuperStorageMod] 关卡 enabledPerkTrees 为空，已基于官方默认列表（{idList.perkTrees.Count} 项）创建。");
                 }
 
                 if (!idList.perkTrees.Contains(CUSTOM_TREE_ID))
@@ -765,8 +883,19 @@ namespace SuperStorageMod
             myInvoker._overrideInteractNameKey = CUSTOM_INTERACT_KEY;
             myInvoker.InteractName = CUSTOM_INTERACT_KEY;
 
-            myInvokerGo.SetActive(wasActive);
+            // 克隆时官方 invoker 处于 inactive，所以克隆体也是 inactive，其 Awake 还没跑。
+            // 这里强制激活：否则 Awake 永不执行（交互组同步、collider 补全都会缺失），
+            // 玩家在游戏里永远看不到自定义交互入口。
+            myInvokerGo.SetActive(true);
+            if (!wasActive)
+            {
+                Debug.LogWarning("[SuperStorageMod] 官方 invoker 在场景中处于 inactive，已强制激活自定义 invoker。");
+            }
             officialInvoker.gameObject.SetActive(wasActive);
+
+            // 位置/旋转跟随官方 invoker，保证交互射线能命中。
+            myInvokerGo.transform.position = officialInvoker.transform.position;
+            myInvokerGo.transform.rotation = officialInvoker.transform.rotation;
 
             myInvokerGo.layer = LayerMask.NameToLayer("Interactable");
 
@@ -854,6 +983,11 @@ namespace SuperStorageMod
             if (graph == null) return null;
             try
             {
+                // 幂等：若该 Perk 已有图节点就直接复用，避免重复调用产生重复节点
+                // （PerkRelationGraph.GetRelatedNode 只返回第一个匹配项，重复节点会让 UI 错乱）。
+                var existing = (graph as PerkRelationGraph)?.GetRelatedNode(perk);
+                if (existing != null) return existing;
+
                 var nodeType = typeof(PerkRelationNode);
 
                 var addNodeMethod = typeof(Graph).GetMethod("AddNode", new[] { typeof(Type), typeof(Vector2) });
@@ -893,39 +1027,56 @@ namespace SuperStorageMod
 
         private static void SubscribePerkUnlockEvent(Perk perk)
         {
+            if (perk == null) return;
             try
             {
-                if (_onUnlockStateChangedField == null)
-                {
-                    _onUnlockStateChangedField = typeof(Perk).GetField("onUnlockStateChanged",
-                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                }
-
-                if (_onUnlockStateChangedField == null)
-                {
-                    Debug.LogWarning("[SuperStorageMod] Could not find Perk.onUnlockStateChanged field.");
-                    return;
-                }
-
-                var currentDel = _onUnlockStateChangedField.GetValue(perk) as Delegate;
-                var handler = new Action<Perk, bool>((p, unlocked) =>
-                {
-                    if (unlocked)
-                    {
-                        var tree = GetFieldObject<PerkTree>(p, "master");
-                        if (tree != null)
-                        {
-                            SaveUnlockedBackupToDisk(tree);
-                            _cachedBackupCapacity = -1;
-                        }
-                    }
-                });
-
-                _onUnlockStateChangedField.SetValue(perk, Delegate.Combine(currentDel, handler));
+                // onUnlockStateChanged 是 public 事件（Perk.cs:146），直接 += 即可，
+                // 无需反射。反射路径仅作为兼容兜底保留。
+                perk.onUnlockStateChanged += OnPerkUnlockStateChanged;
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[SuperStorageMod] Failed to subscribe to Perk unlock event: {ex.Message}");
+                Debug.LogWarning($"[SuperStorageMod] 直接订阅 Perk 解锁事件失败，尝试反射兜底: {ex.Message}");
+                try
+                {
+                    if (_onUnlockStateChangedField == null)
+                    {
+                        _onUnlockStateChangedField = typeof(Perk).GetField("onUnlockStateChanged",
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    }
+
+                    if (_onUnlockStateChangedField == null)
+                    {
+                        Debug.LogWarning("[SuperStorageMod] Could not find Perk.onUnlockStateChanged field.");
+                        return;
+                    }
+
+                    var currentDel = _onUnlockStateChangedField.GetValue(perk) as Delegate;
+                    _onUnlockStateChangedField.SetValue(perk, Delegate.Combine(currentDel, (Action<Perk, bool>)OnPerkUnlockStateChanged));
+                }
+                catch (Exception innerEx)
+                {
+                    Debug.LogWarning($"[SuperStorageMod] 反射订阅 Perk 解锁事件也失败: {innerEx.Message}");
+                }
+            }
+        }
+
+        // 解锁瞬间立即落盘备份（事件驱动，替代旧的轮询）。
+        private static void OnPerkUnlockStateChanged(Perk perk, bool unlocked)
+        {
+            if (!unlocked) return;
+            try
+            {
+                var tree = perk.Master ?? GetFieldObject<PerkTree>(perk, "master");
+                if (tree != null)
+                {
+                    SaveUnlockedBackupToDisk(tree);
+                    _cachedBackupCapacity = -1;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod] 处理解锁事件时异常: {ex.Message}");
             }
         }
 
@@ -999,6 +1150,172 @@ namespace SuperStorageMod
             var fi = GetCachedField(target.GetType(), fieldName);
             if (fi == null) return null;
             return fi.GetValue(target) as T;
+        }
+
+        #endregion
+
+        #region 扩容箱 ID 解析（替代硬编码）
+
+        // 运行期把扩容箱的内部名解析成 TypeID；解析失败退回硬编码兜底值。
+        // 只在第一次调用时真正解析，之后走缓存。
+        private static void ResolveBoxIds()
+        {
+            if (_boxIdsResolved) return;
+            _boxIdsResolved = true;
+
+            var resolved = new int[BoxDefinitions.Length];
+            for (int i = 0; i < BoxDefinitions.Length; i++)
+            {
+                var (internalName, fallbackId) = BoxDefinitions[i];
+                resolved[i] = ResolveBoxId(internalName, fallbackId);
+            }
+            _boxIds = resolved;
+
+            Debug.Log($"[SuperStorageMod] 扩容箱 ID 解析结果: S={resolved[0]}, M={resolved[1]}, L={resolved[2]}");
+        }
+
+        private static int ResolveBoxId(string internalName, int fallbackId)
+        {
+            try
+            {
+                if (ItemAssetsCollection.Instance == null)
+                {
+                    Debug.LogWarning($"[SuperStorageMod] ItemAssetsCollection 尚未就绪，'{internalName}' 退回硬编码 ID {fallbackId}。");
+                    return fallbackId;
+                }
+
+                // ① 官方按名查表
+                int id = ItemAssetsCollection.TryGetIDByName(internalName);
+                if (id > 0)
+                {
+                    if (id != fallbackId)
+                    {
+                        Debug.Log($"[SuperStorageMod] '{internalName}' 运行期 ID={id}（硬编码为 {fallbackId}，已采用运行期值）。");
+                    }
+                    return id;
+                }
+
+                // ② 忽略大小写再查一次
+                int byDisplay = ItemAssetsCollection.TryGetIDByName(internalName, true);
+                if (byDisplay > 0)
+                {
+                    Debug.Log($"[SuperStorageMod] '{internalName}' 按忽略大小写查到 ID={byDisplay}。");
+                    return byDisplay;
+                }
+
+                // ③ 直接扫 entries：用 ItemMetaData.Name 做包含匹配，兼容前缀/大小写差异
+                var scanned = ScanEntriesForName(internalName);
+                if (scanned > 0)
+                {
+                    Debug.Log($"[SuperStorageMod] '{internalName}' 扫描 entries 命中 ID={scanned}。");
+                    return scanned;
+                }
+
+                // ④ 仍失败：把疑似相关的条目打出来，便于实机定位真实内部名
+                DumpSimilarEntries(internalName);
+
+                Debug.LogWarning($"[SuperStorageMod] 找不到物品 '{internalName}'，退回硬编码 ID {fallbackId}。若该 ID 无效，升级所需物品会被跳过。");
+                return fallbackId;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod] 解析物品 '{internalName}' 时异常: {ex.Message}，退回硬编码 ID {fallbackId}。");
+                return fallbackId;
+            }
+        }
+
+        // 扫描 ItemAssetsCollection.entries，按 metaData.Name 做“包含”匹配。
+        // 取最长的匹配名，避免 "Item_ContinerS" 被 "Item_Continer" 之类更短的名字抢先命中。
+        private static int ScanEntriesForName(string name)
+        {
+            var entries = ItemAssetsCollection.Instance?.entries;
+            if (entries == null) return -1;
+
+            int bestId = -1;
+            int bestLen = -1;
+            foreach (var entry in entries)
+            {
+                if (entry == null) continue;
+                var metaName = entry.metaData.Name;
+                if (string.IsNullOrEmpty(metaName)) continue;
+                if (metaName.IndexOf(name, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                if (metaName.Length > bestLen)
+                {
+                    bestLen = metaName.Length;
+                    bestId = entry.typeID;
+                }
+            }
+            return bestId;
+        }
+
+        // 诊断用：打印名字里含 "Continer" 的条目（最多 12 条），一次性输出。
+        private static bool _entriesDumped;
+
+        private static void DumpSimilarEntries(string name)
+        {
+            if (_entriesDumped) return;
+            _entriesDumped = true;
+
+            try
+            {
+                var entries = ItemAssetsCollection.Instance?.entries;
+                if (entries == null)
+                {
+                    Debug.LogWarning("[SuperStorageMod][诊断] entries 为 null。");
+                    return;
+                }
+
+                // 用 internalName 的主体部分做模糊关键词，例如 Item_ContinerS -> Continer
+                string keyword = "Continer";
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[SuperStorageMod][诊断] entries 总数={entries.Count}；名字含 '{keyword}' 的条目：");
+
+                int shown = 0;
+                foreach (var entry in entries)
+                {
+                    if (entry == null) continue;
+                    var metaName = entry.metaData.Name;
+                    if (string.IsNullOrEmpty(metaName)) continue;
+                    if (metaName.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    sb.Append($"\n    typeID={entry.typeID} name='{metaName}' displayKey='{entry.metaData.DisplayNameKey}'");
+                    if (++shown >= 12) break;
+                }
+
+                if (shown == 0)
+                {
+                    sb.Append("（无）");
+                }
+
+                Debug.LogWarning(sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[SuperStorageMod][诊断] dump entries 失败: {ex.Message}");
+            }
+        }
+
+        // 根据已解析的箱子 ID + 等级索引，构造 Cost 需要的 (id, amount) 数组。
+        // 返回空数组表示“这些箱子都不可用”，调用方会退化为纯金钱消耗。
+        private static (int id, int amount)[] GetTierItems(int tierIndex)
+        {
+            if (_boxIds == null || tierIndex < 0 || tierIndex >= TierBoxAmounts.Length)
+            {
+                return Array.Empty<(int, int)>();
+            }
+
+            var amounts = TierBoxAmounts[tierIndex];
+            var list = new List<(int id, int amount)>(amounts.Length);
+            for (int i = 0; i < amounts.Length && i < _boxIds.Length; i++)
+            {
+                int id = _boxIds[i];
+                if (id > 0 && amounts[i] > 0)
+                {
+                    list.Add((id, amounts[i]));
+                }
+            }
+            return list.ToArray();
         }
 
         #endregion
@@ -1099,25 +1416,84 @@ namespace SuperStorageMod
             if (tree == null) return;
             try
             {
-                var ids = tree.Perks
-                    .Where(p => p != null && (p.DisplayNameRaw ?? string.Empty).StartsWith(PERK_NAME_PREFIX) && p.Unlocked)
-                    .Select(p => p.DisplayNameRaw ?? p.gameObject.name)
-                    .ToArray();
+                int totalPerks = 0;
+                int unlockedPerks = 0;
+                var ids = new List<string>(Tiers.Length);
 
-                if (ids.Length > 0)
+                foreach (var p in tree.Perks)
                 {
-                    var lines = new List<string>(ids.Length + 1);
-                    lines.Add($"#version:{MOD_DATA_VERSION}");
-                    lines.AddRange(ids);
-                    File.WriteAllLines(GetBackupPath(), lines);
-                    _cachedBackupCapacity = -1;
-                    Debug.Log($"[SuperStorageMod] Saved {ids.Length} unlocked perks to backup.");
+                    if (p == null) continue;
+                    totalPerks++;
+                    if (p.Unlocked) unlockedPerks++;
+
+                    var raw = p.DisplayNameRaw ?? string.Empty;
+                    if (raw.StartsWith(PERK_NAME_PREFIX) && p.Unlocked)
+                    {
+                        ids.Add(raw);
+                    }
                 }
+
+                // 诊断：暴露 Perks 集合规模与解锁计数（每个会话只打一次，避免刷屏）
+                if (!_snapshotLogged)
+                {
+                    _snapshotLogged = true;
+                    Debug.Log($"[SuperStorageMod] 备份快照: Perks={totalPerks}, Unlocked={unlockedPerks}, 匹配前缀={ids.Count}");
+                }
+
+                var path = GetBackupPath();
+
+                // 空集合也要写盘：否则旧备份会一直残留，CalculateCapacityFromBackup 会继续为
+                // 已经不再解锁的等级发放容量。但为避免“树暂时异常导致全锁”把好备份抹掉，
+                // 只在文件本来就不存在、或本来就已为空时，才用空集合覆盖。
+                if (ids.Count == 0)
+                {
+                    if (File.Exists(path) && HasAnyUnlockedEntry(path))
+                    {
+                        Debug.LogWarning("[SuperStorageMod] 当前没有任何已解锁等级，但备份文件非空，保留原备份（避免误删）。");
+                        return;
+                    }
+                }
+
+                var lines = new List<string>(ids.Count + 1) { $"#version:{MOD_DATA_VERSION}" };
+                lines.AddRange(ids);
+
+                // 原子写：先写临时文件再替换，避免崩溃时留下半截文件。
+                var tmp = path + ".tmp";
+                File.WriteAllLines(tmp, lines);
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+                File.Move(tmp, path);
+
+                _cachedBackupCapacity = -1;
+                Debug.Log($"[SuperStorageMod] Saved {ids.Count} unlocked perks to backup.");
             }
             catch (Exception ex)
             {
                 Debug.LogWarning($"[SuperStorageMod] Failed to save backup: {ex.Message}");
             }
+        }
+
+        // 备份文件里是否存在至少一个非注释、非空行（即至少有一个已解锁条目）。
+        private static bool HasAnyUnlockedEntry(string path)
+        {
+            try
+            {
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (!string.IsNullOrWhiteSpace(line) && !line.StartsWith("#"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // 读不出来时保守处理：当作有内容，避免误删。
+                return true;
+            }
+            return false;
         }
 
         private static void RestoreUnlockedFromDisk(PerkTree tree)
@@ -1150,6 +1526,11 @@ namespace SuperStorageMod
 
             if (set.Count == 0) return;
 
+            // 诊断：进入恢复前的状态
+            int perksBefore = tree.Perks.Count(p => p != null);
+            int unlockedBefore = tree.Perks.Count(p => p != null && p.Unlocked);
+            Debug.Log($"[SuperStorageMod] 恢复前: 备份条目={set.Count}, Perks={perksBefore}, 已解锁={unlockedBefore}");
+
             foreach (var p in tree.Perks)
             {
                 if (p == null) continue;
@@ -1170,6 +1551,9 @@ namespace SuperStorageMod
                     Debug.LogError($"[SuperStorageMod] Failed to restore perk {identifier}: {ex}");
                 }
             }
+
+            int unlockedAfter = tree.Perks.Count(p => p != null && p.Unlocked);
+            Debug.Log($"[SuperStorageMod] 恢复后: 已解锁={unlockedAfter}");
 
             PlayerStorage.NotifyCapacityDirty();
         }
